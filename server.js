@@ -6,7 +6,6 @@ console.log('🔍 ENV CHECK:');
 console.log('   MONGO_URI:', process.env.MONGO_URI ? '✅ found' : '❌ undefined');
 console.log('   MONGODB_URI:', process.env.MONGODB_URI ? '✅ found' : '❌ undefined');
 console.log('   JWT_SECRET:', process.env.JWT_SECRET ? '✅ found' : '❌ undefined');
-console.log('   PORT:', process.env.PORT || '5000 (default)');
 
 const express     = require('express');
 const cors        = require('cors');
@@ -33,13 +32,13 @@ app.use(cors({
 
 // ── Rate limiting ──────────────────────────────────
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 200,
   message: { error: 'Too many requests, please try again later.' },
 });
 app.use('/api', limiter);
 
-// Stricter limit on auth routes
+// ── Auth limiter ───────────────────────────────────
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -55,7 +54,11 @@ if (process.env.NODE_ENV === 'development') app.use(morgan('dev'));
 
 // ── Health check ───────────────────────────────────
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', env: process.env.NODE_ENV, time: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    env: process.env.NODE_ENV,
+    time: new Date().toISOString()
+  });
 });
 
 // ── Routes ─────────────────────────────────────────
@@ -79,17 +82,14 @@ app.use('/api/newsletter',  require('./routes/contact'));
 
 // ── 404 handler ────────────────────────────────────
 app.use((req, res) => {
-  res.status(404).json({ error: `Route ${req.method} ${req.path} not found` });
+  res.status(404).json({
+    error: `Route ${req.method} ${req.path} not found`
+  });
 });
 
 // ── Global error handler ───────────────────────────
 app.use(errorHandler);
 
-// ── Start ──────────────────────────────────────────
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`\n🚀 Server running on port ${PORT} [${process.env.NODE_ENV}]`);
-  console.log(`📡 API: http://localhost:${PORT}/api`);
-});
+// ✅ IMPORTANT: DO NOT use app.listen() for Vercel
 
 module.exports = app;
