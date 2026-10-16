@@ -1,7 +1,8 @@
 // routes/earnings.js — income + expenses for Atelier
 const router  = require('express').Router();
 const Earning = require('../models/Earning');
-const { protect } = require('../middleware/auth');
+const { protect, requirePremium } = require('../middleware/auth');
+const { stripProtected, clampInt, str } = require('../utils/sanitize');
 
 router.use(protect);
 
@@ -11,11 +12,11 @@ router.get('/', async (req, res, next) => {
     const { type, year, limit = 500 } = req.query;
     const filter = { user: req.user._id };
     if (type) filter.type = type;
-    if (year) filter.date = { $regex: `^${year}` };
+    if (/^\d{4}$/.test(String(year || ''))) filter.date = { $regex: `^${year}` };
 
     const earnings = await Earning.find(filter)
       .sort({ date: -1, createdAt: -1 })
-      .limit(+limit);
+      .limit(clampInt(limit, { max: 1000, def: 100 }));
     res.json({ earnings });
   } catch (err) { next(err); }
 });
@@ -25,10 +26,11 @@ router.post('/', async (req, res, next) => {
   try {
     const { name, amount, type = 'expense', category = 'Other', date, note } = req.body;
     if (!name?.trim()) return res.status(400).json({ error: 'Name is required' });
-    if (amount === undefined) return res.status(400).json({ error: 'Amount is required' });
+    if (!Number.isFinite(Number(amount))) return res.status(400).json({ error: 'Amount must be a number' });
+    if (!['income', 'expense'].includes(type)) return res.status(400).json({ error: 'Type must be income or expense' });
 
     const earning = await Earning.create({
-      user: req.user._id, name, amount, type, category,
+      user: req.user._id, name: str(name, 200), amount: Number(amount), type, category: str(category, 60) || 'Other',
       date: date || new Date().toISOString().split('T')[0],
       note: note || '',
     });
@@ -41,7 +43,7 @@ router.patch('/:id', async (req, res, next) => {
   try {
     const earning = await Earning.findOneAndUpdate(
       { _id: req.params.id, user: req.user._id },
-      { ...req.body },
+      stripProtected(req.body),
       { new: true }
     );
     if (!earning) return res.status(404).json({ error: 'Entry not found' });
@@ -61,7 +63,7 @@ router.delete('/:id', async (req, res, next) => {
 // Returns totals grouped by type and category
 router.get('/summary', async (req, res, next) => {
   try {
-    const { year = new Date().getFullYear() } = req.query;
+    const year = /^\d{4}$/.test(String(req.query.year || '')) ? String(req.query.year) : String(new Date().getFullYear());
 
     const [incomeAgg, expenseAgg] = await Promise.all([
       Earning.aggregate([

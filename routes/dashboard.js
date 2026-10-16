@@ -26,9 +26,9 @@ router.get('/', async (req, res, next) => {
       connections,
       earnings,
     ] = await Promise.all([
-      Client.find({ user: uid }).select('status revenue outstanding updatedAt'),
-      Invoice.find({ user: uid }).select('status total issueDate dueDate createdAt'),
-      Task.find({ user: uid }).select('status priority deadline completed createdAt'),
+      Client.find({ user: uid }).select('status revenue outstanding updatedAt createdAt'),
+      Invoice.find({ user: uid }).select('status total issueDate dueDate createdAt paidAt'),
+      Task.find({ user: uid }).select('status priority deadline completed createdAt completedAt'),
       Connection.find({ user: uid }).select('status favorite updatedAt').lean(),
       Earning.find({ user: uid }).select('type amount date'),
     ]);
@@ -40,18 +40,18 @@ router.get('/', async (req, res, next) => {
 
     // ── Invoice stats ──────────────────────────────
     const paidInvoices    = invoices.filter(i => i.status === 'paid');
-    const pendingInvoices = invoices.filter(i => ['draft','sent'].includes(i.status));
-    const overdueInvoices = invoices.filter(i =>
-      i.status !== 'paid' && i.dueDate && new Date(i.dueDate) < now
-    );
+    const isOverdue = (i) => i.status === 'overdue' || (['draft','sent'].includes(i.status) && i.dueDate && new Date(i.dueDate) < now);
+    const overdueInvoices = invoices.filter(isOverdue);
+    const pendingInvoices = invoices.filter(i => i.status === 'sent' && !isOverdue(i));
 
     const totalRevenue    = paidInvoices.reduce((s, i) => s + (i.total || 0), 0);
     const pendingRevenue  = pendingInvoices.reduce((s, i) => s + (i.total || 0), 0);
     const overdueRevenue  = overdueInvoices.reduce((s, i) => s + (i.total || 0), 0);
 
     // Revenue this month
+    const paidDate = (i) => new Date(i.paidAt || i.issueDate);
     const monthRevenue = paidInvoices
-      .filter(i => new Date(i.issueDate) >= monthStart)
+      .filter(i => paidDate(i) >= monthStart)
       .reduce((s, i) => s + (i.total || 0), 0);
 
     // Monthly revenue for chart (last 6 months)
@@ -62,8 +62,8 @@ router.get('/', async (req, res, next) => {
       const label = d.toLocaleString('default', { month: 'short' });
       const total = paidInvoices
         .filter(inv => {
-          const d2 = new Date(inv.issueDate);
-          return d2 >= d && d2 <= end;
+          const d2 = paidDate(inv);
+          return d2 >= d && d2 < new Date(end.getTime() + 86400e3);
         })
         .reduce((s, inv) => s + (inv.total || 0), 0);
       monthlyRevenue.push({ month: label, revenue: total });
@@ -73,8 +73,10 @@ router.get('/', async (req, res, next) => {
     const totalTasks    = tasks.length;
     const completedTasks= tasks.filter(t => t.completed || t.status === 'done').length;
     const overdueTasks  = tasks.filter(t =>
-      !t.completed && t.deadline && new Date(t.deadline) < now
+      !t.completed && t.status !== 'done' && t.deadline && new Date(t.deadline) < now
     ).length;
+    const tasksPending  = totalTasks - completedTasks;
+    const productivityScore = totalTasks ? Math.round((completedTasks / totalTasks) * 100) : 0;
     const dueSoon = tasks.filter(t => {
       if (t.completed || !t.deadline) return false;
       const diff = (new Date(t.deadline) - now) / 86400000;
@@ -135,7 +137,7 @@ router.get('/', async (req, res, next) => {
       overdueCount:    overdueInvoices.length,
 
       // Tasks
-      totalTasks, completedTasks, overdueTasks, dueSoon, tasksByStatus,
+      totalTasks, completedTasks, overdueTasks, dueSoon, tasksByStatus, tasksPending, taskCount: tasksPending, productivityScore,
 
       // Connections
       totalConnections, favorites,
@@ -170,34 +172,26 @@ router.get('/stats', async (req, res, next) => {
 router.get('/revenue', async (req, res, next) => {
   try {
     const uid    = req.user._id;
-    const months = parseInt(req.query.months) || 6;
+    const months = Math.min(24, Math.max(1, parseInt(req.query.months) || 6));
     const now    = new Date();
-    const data   = [];
+    const from   = new Date(now.getFullYear(), now.getMonth() - (months - 1), 1);
 
+    const [invoices, expenses] = await Promise.all([
+      Invoice.find({ user: uid, status: 'paid' }).select('total paidAt issueDate').lean(),
+      Earning.find({ user: uid, type: 'expense', date: { $gte: from.toISOString().slice(0, 10) } }).select('amount date').lean(),
+    ]);
+
+    const data = [];
     for (let i = months - 1; i >= 0; i--) {
       const start = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      const end   = new Date(now.getFullYear(), now.getMonth() - i + 1, 0);
-      const label = start.toLocaleString('default', { month: 'short', year: '2-digit' });
-
-      const invoices = await Invoice.find({
-        user: uid, status: 'paid',
-        issueDate: { $gte: start.toISOString().split('T')[0], $lte: end.toISOString().split('T')[0] },
-      }).select('total');
-
-      const revenue  = invoices.reduce((s, inv) => s + (inv.total || 0), 0);
-      const expenses = await Earning.aggregate([
-        { $match: { user: uid, type: 'expense', date: { $regex: `^${start.toISOString().slice(0,7)}` } } },
-        { $group: { _id: null, total: { $sum: { $abs: '$amount' } } } },
-      ]);
-
-      data.push({
-        month:    label,
-        revenue,
-        expenses: expenses[0]?.total || 0,
-        profit:   revenue - (expenses[0]?.total || 0),
-      });
+      const key   = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}`;
+      const label = start.toLocaleString('en-US', { month: 'short', year: '2-digit' });
+      const revenue = invoices
+        .filter(inv => { const d = new Date(inv.paidAt || inv.issueDate); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` === key; })
+        .reduce((s, inv) => s + (inv.total || 0), 0);
+      const exp = expenses.filter(e => String(e.date || '').startsWith(key)).reduce((s, e) => s + Math.abs(e.amount || 0), 0);
+      data.push({ month: label, revenue, expenses: exp, profit: revenue - exp });
     }
-
     res.json({ data });
   } catch (err) { next(err); }
 });

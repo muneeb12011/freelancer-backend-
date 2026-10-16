@@ -26,6 +26,10 @@ const InvoiceSchema = new mongoose.Schema({
   subtotal:      { type: Number, default: 0 },
   taxRate:       { type: Number, default: 0 },
   taxAmount:     { type: Number, default: 0 },
+  discount:      { type: Number, default: 0 },
+  currency:      { type: String, default: 'USD' },
+  paymentMethod: { type: String, default: '', maxlength: 40 },
+  paymentRef:    { type: String, default: '', maxlength: 120 },
   total:         { type: Number, default: 0 },
 
   status:        { type: String, enum: ['draft','sent','paid','overdue','cancelled'], default: 'draft' },

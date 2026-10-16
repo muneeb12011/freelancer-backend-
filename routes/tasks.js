@@ -3,6 +3,17 @@ const router = require('express').Router();
 const Task   = require('../models/Task');
 const Client = require('../models/Client');
 const { protect } = require('../middleware/auth');
+const { stripProtected, searchRegex, clampInt, isId } = require('../utils/sanitize');
+
+// Fields only the server manages (embedded arrays have their own endpoints).
+const TASK_SERVER_FIELDS = ['taskNumber', 'trackedMinutes', 'timeEntries', 'comments', 'activity', 'completedAt', 'stateChangedAt'];
+const cleanTask = (body) => {
+  const out = stripProtected(body, TASK_SERVER_FIELDS);
+  if (out.clientId && !out.client) out.client = out.clientId;
+  delete out.clientId;
+  if (out.client === '' || (out.client && !isId(out.client))) out.client = undefined;
+  return out;
+};
 
 router.use(protect);
 
@@ -88,7 +99,7 @@ router.get('/', async (req, res, next) => {
     if (category) filter.category = category;
     if (sprint)   filter.sprint = sprint;
     if (tag)      filter.tags = tag;
-    if (clientId) filter.$or = [{ client: clientId }, { clientId }];
+    if (clientId && isId(clientId)) filter.client = clientId;
     if (completed === 'false') filter.completed = false;
     if (completed === 'true')  filter.completed = true;
 
@@ -98,23 +109,25 @@ router.get('/', async (req, res, next) => {
       filter.deadline   = { $lt: new Date() };
     }
     if (hasDeadline === 'true')  filter.deadline = { $exists: true, $ne: null };
-    if (noDeadline === 'true')   filter.deadline = { $in: [null, undefined] };
+    if (noDeadline === 'true')   filter.deadline = null;
 
     if (search) {
-      const q = new RegExp(search, 'i');
+      const q = searchRegex(search);
       filter.$or = [{ title: q }, { description: q }, { tags: q }, { taskNumber: q }];
     }
 
-    // Multi-field sort
+    // Multi-field sort (whitelisted)
+    const SORTABLE = ['order', 'deadline', 'createdAt', 'updatedAt', 'priority', 'status', 'title'];
     const sortObj = {};
-    sort.split(',').forEach(f => {
-      const dir = f.startsWith('-') ? -1 : 1;
-      sortObj[f.replace('-', '')] = dir;
+    String(sort).split(',').forEach(f => {
+      const key = f.replace(/^-/, '');
+      if (SORTABLE.includes(key)) sortObj[key] = f.startsWith('-') ? -1 : 1;
     });
+    if (!Object.keys(sortObj).length) Object.assign(sortObj, { order: 1, deadline: 1, createdAt: -1 });
 
     const tasks = await Task.find(filter)
-      .sort({ order: 1, deadline: 1, createdAt: -1, ...sortObj })
-      .limit(+limit)
+      .sort(sortObj)
+      .limit(clampInt(limit, { max: 1000, def: 300 }))
       .populate('client', 'name')
       .lean();
 
@@ -125,7 +138,8 @@ router.get('/', async (req, res, next) => {
 // ── POST /api/tasks ────────────────────────────────
 router.post('/', async (req, res, next) => {
   try {
-    const task = new Task({ ...req.body, user: req.user._id });
+    if (!String(req.body.title || '').trim()) return res.status(400).json({ error: 'Give the task a title' });
+    const task = new Task({ ...cleanTask(req.body), user: req.user._id });
     addActivity(task, 'Task created');
     await task.save();
     res.status(201).json({ task });
@@ -149,16 +163,15 @@ router.patch('/:id', async (req, res, next) => {
     if (!task) return res.status(404).json({ error: 'Not found' });
 
     const prev   = task.toObject();
-    const updates = { ...req.body };
+    const updates = cleanTask(req.body);
+    // Toggling the checkbox maps onto the board columns.
+    if (updates.completed === true && !updates.status) updates.status = 'done';
+    if (updates.completed === false && !updates.status && prev.status === 'done') updates.status = 'todo';
 
     // Track status change
     if (updates.status && updates.status !== prev.status) {
       task.stateChangedAt = new Date();
       addActivity(task, `Status: ${prev.status} → ${updates.status}`);
-      if (updates.status === 'done') {
-        task.completedAt = new Date();
-        task.completed   = true;
-      }
     }
     if (updates.priority && updates.priority !== prev.priority) {
       addActivity(task, `Priority: ${prev.priority} → ${updates.priority}`);
@@ -193,7 +206,7 @@ router.post('/:id/duplicate', async (req, res, next) => {
     const src = await Task.findOne({ _id: req.params.id, user: req.user._id }).lean();
     if (!src) return res.status(404).json({ error: 'Not found' });
     const { _id, taskNumber, createdAt, updatedAt, completedAt, stateChangedAt, activity, ...rest } = src;
-    const dup = new Task({ ...rest, title: `${rest.title} (copy)`, status: 'todo', completed: false, user: req.user._id, subtasks: src.subtasks.map(s=>({...s,done:false,doneAt:null})), comments:[], activity:[] });
+    const dup = new Task({ ...rest, completedAt: undefined, trackedMinutes: 0, timeEntries: [], title: `${rest.title} (copy)`, status: 'todo', completed: false, user: req.user._id, subtasks: src.subtasks.map(s=>({...s,done:false,doneAt:null})), comments:[], activity:[] });
     addActivity(dup, `Duplicated from ${taskNumber}`);
     await dup.save();
     res.status(201).json({ task: dup });
@@ -203,9 +216,11 @@ router.post('/:id/duplicate', async (req, res, next) => {
 // ── POST /api/tasks/reorder ────────────────────────
 router.post('/reorder', async (req, res, next) => {
   try {
+    const rows = Array.isArray(req.body) ? req.body : Array.isArray(req.body?.tasks) ? req.body.tasks : [];
+    const VALID = ['todo','in-progress','review','done'];
     await Promise.all(
-      req.body.map(({ _id, order, status }) =>
-        Task.findOneAndUpdate({ _id, user: req.user._id }, { order, ...(status ? { status } : {}) })
+      rows.slice(0, 500).filter(r => isId(r?._id)).map(({ _id, order, status }) =>
+        Task.findOneAndUpdate({ _id, user: req.user._id }, { order: Number(order) || 0, ...(VALID.includes(status) ? { status, completed: status === 'done', ...(status === 'done' ? { completedAt: new Date() } : {}) } : {}) })
       )
     );
     res.json({ message: 'Reordered' });
@@ -219,7 +234,9 @@ router.post('/:id/subtasks', async (req, res, next) => {
   try {
     const task = await Task.findOne({ _id: req.params.id, user: req.user._id });
     if (!task) return res.status(404).json({ error: 'Not found' });
-    const st = { title: req.body.title.trim(), order: task.subtasks.length };
+    const title = String(req.body.title || '').trim().slice(0, 300);
+    if (!title) return res.status(400).json({ error: 'Subtask needs a title' });
+    const st = { title, order: task.subtasks.length };
     task.subtasks.push(st);
     addActivity(task, `Subtask added: "${st.title}"`);
     await task.save();
@@ -265,7 +282,9 @@ router.post('/:id/comments', async (req, res, next) => {
   try {
     const task = await Task.findOne({ _id: req.params.id, user: req.user._id });
     if (!task) return res.status(404).json({ error: 'Not found' });
-    task.comments.unshift({ text: req.body.text.trim() });
+    const text = String(req.body.text || '').trim().slice(0, 4000);
+    if (!text) return res.status(400).json({ error: 'Comment is empty' });
+    task.comments.unshift({ text, author: req.user.name });
     addActivity(task, 'Comment added');
     await task.save();
     res.json({ task });
@@ -291,7 +310,7 @@ router.post('/:id/time', async (req, res, next) => {
     const task = await Task.findOne({ _id: req.params.id, user: req.user._id });
     if (!task) return res.status(404).json({ error: 'Not found' });
     const mins = parseInt(req.body.minutes) || 0;
-    if (mins < 1) return res.status(400).json({ error: 'Minutes must be > 0' });
+    if (mins < 1 || mins > 24 * 60) return res.status(400).json({ error: 'Log between 1 minute and 24 hours' });
     task.timeEntries.push({ minutes: mins, note: req.body.note || '' });
     task.trackedMinutes = task.timeEntries.reduce((s, e) => s + e.minutes, 0);
     addActivity(task, `${mins}m logged${req.body.note ? ': ' + req.body.note : ''}`);

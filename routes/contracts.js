@@ -1,9 +1,12 @@
 // routes/contracts.js
 const router   = require('express').Router();
 const Contract = require('../models/Contract');
-const { protect } = require('../middleware/auth');
+const { protect, requirePremium } = require('../middleware/auth');
+const { stripProtected, clampInt, str } = require('../utils/sanitize');
 
 router.use(protect);
+// Premium tool — the API enforces it, not just the UI.
+router.use(requirePremium('contracts'));
 
 // ── GET /api/contracts ─────────────────────────────
 router.get('/', async (req, res, next) => {
@@ -38,9 +41,9 @@ router.get('/:id', async (req, res, next) => {
 });
 
 // ── PUT /api/contracts/:id ─────────────────────────
-router.put('/:id', async (req, res, next) => {
+const updateContract = async (req, res, next) => {
   try {
-    const updates = { ...req.body };
+    const updates = stripProtected(req.body);
 
     // Auto-set signedAt when signing
     if (updates.signed && !updates.signedAt) {
@@ -56,7 +59,9 @@ router.put('/:id', async (req, res, next) => {
     if (!contract) return res.status(404).json({ error: 'Contract not found' });
     res.json({ contract });
   } catch (err) { next(err); }
-});
+};
+router.put('/:id', updateContract);
+router.patch('/:id', updateContract);
 
 // ── DELETE /api/contracts/:id ──────────────────────
 router.delete('/:id', async (req, res, next) => {

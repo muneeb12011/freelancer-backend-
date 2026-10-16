@@ -1,9 +1,12 @@
 // routes/proposals.js
 const router   = require('express').Router();
 const Proposal = require('../models/Proposal');
-const { protect } = require('../middleware/auth');
+const { protect, requirePremium } = require('../middleware/auth');
+const { stripProtected, clampInt, str } = require('../utils/sanitize');
 
 router.use(protect);
+// Premium tool — the API enforces it, not just the UI.
+router.use(requirePremium('proposals'));
 
 // ── GET /api/proposals ─────────────────────────────
 router.get('/', async (req, res, next) => {
@@ -20,7 +23,7 @@ router.post('/', async (req, res, next) => {
     const { title } = req.body;
     if (!title?.trim()) return res.status(400).json({ error: 'Title is required' });
 
-    const proposal = await Proposal.create({ ...req.body, user: req.user._id });
+    const proposal = await Proposal.create({ ...stripProtected(req.body), user: req.user._id });
     res.status(201).json({ proposal });
   } catch (err) { next(err); }
 });
@@ -39,7 +42,7 @@ router.put('/:id', async (req, res, next) => {
   try {
     const proposal = await Proposal.findOneAndUpdate(
       { _id: req.params.id, user: req.user._id },
-      { ...req.body },
+      stripProtected(req.body),
       { new: true, runValidators: true }
     );
     if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
@@ -52,7 +55,7 @@ router.patch('/:id', async (req, res, next) => {
   try {
     const proposal = await Proposal.findOneAndUpdate(
       { _id: req.params.id, user: req.user._id },
-      { ...req.body },
+      stripProtected(req.body),
       { new: true }
     );
     if (!proposal) return res.status(404).json({ error: 'Proposal not found' });

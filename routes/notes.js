@@ -1,7 +1,8 @@
 // routes/notes.js — Atelier Quick Notes
 const router = require('express').Router();
 const Note   = require('../models/Note');
-const { protect } = require('../middleware/auth');
+const { protect, requirePremium } = require('../middleware/auth');
+const { stripProtected, clampInt, str } = require('../utils/sanitize');
 
 router.use(protect);
 
@@ -10,11 +11,11 @@ router.get('/', async (req, res, next) => {
   try {
     const { cat, limit = 100 } = req.query;
     const filter = { user: req.user._id };
-    if (cat && cat !== 'All') filter.cat = cat;
+    if (cat && cat !== 'All') filter.cat = str(cat, 60);
 
     const notes = await Note.find(filter)
       .sort({ pinned: -1, createdAt: -1 })
-      .limit(+limit);
+      .limit(clampInt(limit, { max: 1000, def: 100 }));
     res.json({ notes });
   } catch (err) { next(err); }
 });
@@ -27,7 +28,7 @@ router.post('/', async (req, res, next) => {
 
     const note = await Note.create({
       user: req.user._id,
-      text: text.trim(),
+      text: str(text, 10000),
       cat,
       pinned,
       ts: new Date().toLocaleString(),
@@ -41,7 +42,7 @@ router.patch('/:id', async (req, res, next) => {
   try {
     const note = await Note.findOneAndUpdate(
       { _id: req.params.id, user: req.user._id },
-      { ...req.body },
+      stripProtected(req.body),
       { new: true }
     );
     if (!note) return res.status(404).json({ error: 'Note not found' });

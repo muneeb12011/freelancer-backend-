@@ -1,56 +1,41 @@
-// routes/profile.js
-const router  = require('express').Router();
-const User    = require('../models/User');
-const Invoice = require('../models/Invoice');
+// routes/deadlines.js — manual deadlines for the dashboard.
+const router   = require('express').Router();
+const Deadline = require('../models/Deadline');
 const { protect } = require('../middleware/auth');
+const { asyncHandler, badRequest, notFound } = require('../utils/http');
+const { pick, str, clampInt } = require('../utils/sanitize');
 
 router.use(protect);
 
-// ── GET /api/profile ───────────────────────────────
-router.get('/', async (req, res, next) => {
-  try {
-    const user = await User.findById(req.user._id);
-    res.json({ user });
-  } catch (err) { next(err); }
-});
+const FIELDS = ['title', 'dueDate', 'priority', 'completed', 'note'];
 
-// ── PATCH /api/profile ─────────────────────────────
-router.patch('/', async (req, res, next) => {
-  try {
-    const allowed = ['name','title','bio','phone','location','website',
-      'linkedin','github','twitter','hourlyRate','minProject',
-      'availability','skills','languages','avatar','notifications',
-      'contractStatus','contractExpiry','contractValue','source','priority'];
-    const updates = {};
-    allowed.forEach(f => { if (req.body[f] !== undefined) updates[f] = req.body[f]; });
-    const user = await User.findByIdAndUpdate(req.user._id, updates, { new: true });
-    res.json({ user });
-  } catch (err) { next(err); }
-});
+router.get('/', asyncHandler(async (req, res) => {
+  const filter = { user: req.user._id };
+  if (req.query.completed === 'false') filter.completed = false;
+  const deadlines = await Deadline.find(filter).sort({ completed: 1, dueDate: 1 }).limit(clampInt(req.query.limit, { max: 500, def: 200 }));
+  res.json({ deadlines });
+}));
 
-// ── GET /api/profile/reviews ───────────────────────
-router.get('/reviews', async (req, res, next) => {
-  try {
-    // Placeholder — extend with a Review model later
-    res.json({ reviews: [] });
-  } catch (err) { next(err); }
-});
+router.post('/', asyncHandler(async (req, res) => {
+  const data = pick(req.body, FIELDS);
+  if (!str(data.title)) throw badRequest('Give the deadline a title');
+  if (!data.dueDate || Number.isNaN(new Date(data.dueDate).getTime())) throw badRequest('Pick a valid due date');
+  const deadline = await Deadline.create({ ...data, user: req.user._id });
+  res.status(201).json({ deadline });
+}));
 
-// ── GET /api/profile/:id ───────────────────────────
-router.get('/:id', async (req, res, next) => {
-  try {
-    const user = await User.findById(req.params.id)
-      .select('-password -notifications');
-    if (!user) return res.status(404).json({ error: 'Profile not found' });
-    res.json({ user });
-  } catch (err) { next(err); }
+const update = asyncHandler(async (req, res) => {
+  const deadline = await Deadline.findOneAndUpdate({ _id: req.params.id, user: req.user._id }, pick(req.body, FIELDS), { new: true, runValidators: true });
+  if (!deadline) throw notFound('Deadline not found');
+  res.json({ deadline });
 });
+router.patch('/:id', update);
+router.put('/:id', update);
 
-// ── GET /api/profile/:id/reviews ──────────────────
-router.get('/:id/reviews', async (req, res, next) => {
-  try {
-    res.json({ reviews: [] });
-  } catch (err) { next(err); }
-});
+router.delete('/:id', asyncHandler(async (req, res) => {
+  const r = await Deadline.deleteOne({ _id: req.params.id, user: req.user._id });
+  if (!r.deletedCount) throw notFound('Deadline not found');
+  res.json({ message: 'Deadline deleted' });
+}));
 
 module.exports = router;

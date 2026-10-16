@@ -1,127 +1,59 @@
-# Freelancer Assistant — Backend API
+# Aurelance API
 
-Node.js + Express + MongoDB Atlas REST API
+Node 20+ · Express 4 · MongoDB (Mongoose 8). Deploys to Vercel (`vercel.json`) or any Node host (`npm start`).
 
-## Setup
-
+## Run locally
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Create your .env file
-cp .env.example .env
-# Then fill in your MONGO_URI and JWT_SECRET
-
-# 3. Start dev server
+cp .env.example .env      # fill MONGO_URI + JWT_SECRET at minimum
 npm run dev
+```
+Optional features switch on when their keys exist — check `GET /api/health → features`.
 
-# 4. Start production server
-npm start
+| Feature | Env vars |
+|---|---|
+| Google / GitHub sign-in | `GOOGLE_CLIENT_ID/SECRET`, `GITHUB_CLIENT_ID/SECRET` (callback: `$SERVER_URL/api/auth/<provider>/callback`) |
+| Email (reset, 2FA, receipts, tickets) | `RESEND_API_KEY`, `EMAIL_FROM` (verified domain) |
+| AI features | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` |
+| Premium payments | `SAFEPAY_API_KEY`, `SAFEPAY_SECRET_KEY`, `SAFEPAY_WEBHOOK_SECRET`, `SAFEPAY_ENV` |
+| Daily jobs (reminders, digest) | `CRON_SECRET` — Vercel Cron calls `GET /api/cron/daily` |
+| ID verification | `VERIFICATION_KEY` (64 hex chars, AES-256-GCM) + `ADMIN_EMAILS` for reviewers (`/admin` in the app) |
+
+## Safepay setup
+1. Safepay dashboard → API keys → copy the **public key** (`SAFEPAY_API_KEY`) and **secret key** (`SAFEPAY_SECRET_KEY`).
+2. Webhooks → endpoint `https://<api>/api/billing/safepay/webhook`, copy the webhook secret (`SAFEPAY_WEBHOOK_SECRET`).
+3. Test with `SAFEPAY_ENV=sandbox`, then switch to `production`.
+Activation happens on the signed redirect **or** the signed webhook, idempotently per tracker.
+
+## Structure
+```
+app.js              Express app (security, CORS, routes)
+server.js           entry (Vercel export / local listen + graceful shutdown)
+config/             env validation, db (serverless-cached), passport, plans (single price source)
+middleware/         auth (JWT + revocable sessions, premium/admin gates), rate limits, errors, request ids
+services/           billing, payments/safepay, email (Resend), ai, fx, account export/delete, tickets
+routes/             one file per resource
+test/smoke.test.js  end-to-end API test
 ```
 
-## Folder Structure
+## Social features
+- **Messages** (`/api/messages`): one thread per pair of users, unread counts, read receipts, attachments ≤ 2 MB (stored in `attachments`; move to object storage when volume grows), block/report, email notification throttled to once per 30 min per thread.
+- **Jobs** (`/api/jobs`): post/browse/save/apply/withdraw, poster shortlists/rejects/hires. Hiring opens a thread and adds the poster as a client in the freelancer's CRM. Plan limits in `config/plans.js`.
+- **Verification** (`/api/verification`, `/api/admin/verifications`): email, linked OAuth, and encrypted ID review; images are deleted at decision time.
 
+## Security notes
+- `plan` can only be changed by the billing service (or `/api/admin` for `ADMIN_EMAILS`).
+- Every update strips `user/_id/__v/timestamps` and server-computed fields; regex search input is escaped; `$` operators are stripped from input.
+- JWTs point at a server-side session: devices can be signed out; password reset invalidates all tokens.
+- Reset/verify/email-change tokens are stored hashed; OAuth hands the browser a one-time code instead of a JWT in the URL.
+
+## Tests
+```bash
+MONGO_URI=mongodb://127.0.0.1:27017/aurelance_test npm test
 ```
-backend/
-├── config/
-│   └── db.js              # MongoDB Atlas connection
-├── middleware/
-│   ├── auth.js            # JWT protect middleware
-│   └── errorHandler.js    # Global error handler
-├── models/
-│   ├── User.js
-│   ├── Client.js
-│   ├── Connection.js
-│   ├── Invoice.js
-│   ├── Task.js
-│   ├── Note.js
-│   ├── Earning.js
-│   ├── Contract.js
-│   └── Proposal.js
-├── routes/
-│   ├── auth.js            # /api/auth
-│   ├── clients.js         # /api/clients
-│   ├── connections.js     # /api/connections
-│   ├── invoices.js        # /api/invoices
-│   ├── tasks.js           # /api/tasks
-│   ├── notes.js           # /api/notes
-│   ├── earnings.js        # /api/earnings
-│   ├── contracts.js       # /api/contracts
-│   ├── proposals.js       # /api/proposals
-│   └── dashboard.js       # /api/dashboard
-├── .env.example
-├── .gitignore
-├── package.json
-└── server.js
-```
+Use a throwaway database — the suite drops it.
 
-## API Endpoints
-
-### Auth
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | /api/auth/register | Register new user |
-| POST | /api/auth/login | Login + get token |
-| GET  | /api/auth/me | Get current user |
-| PATCH| /api/auth/me | Update profile |
-| POST | /api/auth/change-password | Change password |
-
-### Clients
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET    | /api/clients | List all clients |
-| POST   | /api/clients | Create client |
-| GET    | /api/clients/:id | Get single client |
-| PATCH  | /api/clients/:id | Update client |
-| DELETE | /api/clients/:id | Delete client |
-
-### Connections
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET    | /api/connections | List connections |
-| POST   | /api/connections | Add connection |
-| PATCH  | /api/connections/:id | Update connection |
-| DELETE | /api/connections/:id | Remove connection |
-| GET    | /api/connections/chat/:id | Get chat messages |
-| POST   | /api/connections/chat/:id | Send message |
-| POST   | /api/connections/collab | Send collab request |
-| POST   | /api/connections/invite | Generate invite link |
-
-### Invoices
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET    | /api/invoices | List invoices |
-| POST   | /api/invoices | Create invoice |
-| PUT    | /api/invoices/:id | Update / mark paid |
-| DELETE | /api/invoices/:id | Delete invoice |
-
-### Tasks
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET    | /api/tasks | List tasks |
-| POST   | /api/tasks | Create task |
-| PATCH  | /api/tasks/:id | Update task |
-| DELETE | /api/tasks/:id | Delete task |
-| POST   | /api/tasks/reorder | Bulk reorder (Kanban) |
-
-### Dashboard
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET    | /api/dashboard | Full stats object |
-| GET    | /api/dashboard/stats | Lightweight counts |
-
-## Environment Variables
-
-```env
-PORT=5000
-NODE_ENV=development
-MONGO_URI=mongodb+srv://...
-JWT_SECRET=your_secret_here
-JWT_EXPIRES_IN=7d
-CLIENT_URL=http://localhost:3000
-```
-
-## MongoDB Atlas Free Tier (M0)
-- 512MB storage — enough for thousands of clients, tasks, invoices
-- Connect from anywhere — whitelist `0.0.0.0/0` in Network Access
-- Free forever — no credit card needed
+## Production checklist
+- `NODE_ENV=production`, long random `JWT_SECRET`, `SERVER_URL`, `CLIENT_URL`
+- `npm run sync-indexes` once after deploying (autoIndex is off in production)
+- Rate limits use in-memory storage per instance; add a Redis store in `middleware/rateLimits.js` if you scale out.

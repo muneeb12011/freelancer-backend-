@@ -13,7 +13,7 @@ const ClientSchema = new mongoose.Schema({
   address:        { type: String, trim: true },
 
   // CRM
-  status:         { type: String, enum: ['Active','In Progress','Lead','On Hold','Completed'], default: 'Lead' },
+  status:         { type: String, enum: ['Active','In Progress','Lead','On Hold','Completed','Archived'], default: 'Lead' },
   priority:       { type: String, enum: ['High','Normal','Low'], default: 'Normal' },
   source:         { type: String, trim: true },
   tags:           [{ type: String, trim: true }],

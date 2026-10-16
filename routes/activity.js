@@ -27,7 +27,7 @@ router.get('/', async (req, res, next) => {
         message: `Invoice #${i.invoiceNumber} — ${i.clientName}`,
         sub:     `$${i.total?.toFixed(2) || '0.00'} · ${i.status}`,
         date:    i.createdAt,
-        color:   '#4a90d9',
+        color:   '#7FA6CF',
       })),
       ...recentTasks.map(t => ({
         id:      t._id,
@@ -35,7 +35,7 @@ router.get('/', async (req, res, next) => {
         message: t.title,
         sub:     `${t.status} · ${t.priority}`,
         date:    t.updatedAt,
-        color:   t.status === 'done' ? '#4caf82' : '#9b72e8',
+        color:   t.status === 'done' ? '#7DC39A' : '#A99BD6',
       })),
       ...recentClients.map(c => ({
         id:      c._id,
@@ -43,7 +43,7 @@ router.get('/', async (req, res, next) => {
         message: `Client added: ${c.name}`,
         sub:     c.status,
         date:    c.createdAt,
-        color:   '#c9a84c',
+        color:   '#CFA75A',
       })),
     ]
       .sort((a, b) => new Date(b.date) - new Date(a.date))

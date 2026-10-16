@@ -1,6 +1,7 @@
 // models/Task.js — Complete production schema
 const mongoose = require('mongoose');
 const { Schema } = mongoose;
+require('./Counter');
 
 // ── Sub-schemas ──────────────────────────────────────────────
 const SubtaskSchema = new Schema({
@@ -80,21 +81,22 @@ TaskSchema.index({ user: 1, sprint: 1 });
 TaskSchema.index({ user: 1, createdAt: -1 });
 
 // ── Auto-generate taskNumber ──────────────────────────────────
-TaskSchema.pre('save', async function (next) {
+TaskSchema.pre('save', async function () {
   if (!this.taskNumber) {
-    const last = await mongoose.model('Task')
-      .findOne({ user: this.user })
-      .sort({ createdAt: -1 })
-      .select('taskNumber')
-      .lean();
-    const lastNum = last?.taskNumber?.match(/(\d+)$/)?.[1];
-    this.taskNumber = 'TK-' + String((parseInt(lastNum || 0) + 1)).padStart(4, '0');
+    const seq = await mongoose.model('Counter').next(`task:${this.user}`, async () => {
+      const rows = await mongoose.model('Task').find({ user: this.user, taskNumber: /^TK-\d+$/ }).select('taskNumber').lean();
+      return rows.reduce((m, r) => Math.max(m, parseInt(r.taskNumber.slice(3), 10) || 0), 0);
+    });
+    this.taskNumber = 'TK-' + String(seq).padStart(4, '0');
   }
   // Track when status changed (for aging)
   if (this.isModified('status')) {
     this.stateChangedAt = new Date();
   }
-  next();
+  if (this.isModified('status')) {
+    if (this.status === 'done') { this.completed = true; if (!this.completedAt) this.completedAt = new Date(); }
+    else if (this.completed) { this.completed = false; this.completedAt = undefined; }
+  }
 });
 
 module.exports = mongoose.model('Task', TaskSchema);

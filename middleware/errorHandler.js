@@ -1,32 +1,46 @@
-// middleware/errorHandler.js — global error handler
+// middleware/errorHandler.js — consistent JSON errors, no internals leaked in production.
+const env    = require('../config/env');
+const logger = require('../utils/logger');
+
+const notFoundHandler = (req, res) => {
+  res.status(404).json({ error: `Route ${req.method} ${req.originalUrl.split('?')[0]} not found`, requestId: req.id });
+};
+
+// eslint-disable-next-line no-unused-vars
 const errorHandler = (err, req, res, next) => {
-  console.error(`[ERROR] ${err.message}`);
+  let status  = err.statusCode || err.status || 500;
+  let message = err.message || 'Internal server error';
+  let details = err.details;
 
-  // Mongoose validation error
   if (err.name === 'ValidationError') {
-    const messages = Object.values(err.errors).map(e => e.message);
-    return res.status(400).json({ error: messages.join('. ') });
+    status = 400;
+    details = Object.fromEntries(Object.entries(err.errors).map(([k, e]) => [k, e.message]));
+    message = Object.values(details).join('. ');
+  } else if (err.code === 11000) {
+    status = 409;
+    const field = Object.keys(err.keyValue || {})[0] || 'value';
+    message = `${field} is already in use`;
+  } else if (err.name === 'CastError') {
+    status = 400;
+    message = `Invalid ${err.path || 'id'}`;
+  } else if (err.type === 'entity.too.large') {
+    status = 413;
+    message = 'Request body is too large';
+  } else if (err.type === 'entity.parse.failed') {
+    status = 400;
+    message = 'Malformed JSON body';
+  } else if (err.message && err.message.startsWith('CORS')) {
+    status = 403;
   }
 
-  // Mongoose duplicate key
-  if (err.code === 11000) {
-    const field = Object.keys(err.keyValue)[0];
-    return res.status(400).json({ error: `${field} already exists` });
+  if (status >= 500) {
+    logger.error(message, { requestId: req.id, path: req.originalUrl, stack: env.isProd ? undefined : err.stack });
+    if (env.isProd && !err.statusCode) message = 'Something went wrong on our side. Please try again.';
   }
 
-  // Mongoose cast error (invalid ObjectId)
-  if (err.name === 'CastError') {
-    return res.status(400).json({ error: 'Invalid ID format' });
-  }
-
-  // JWT errors
-  if (err.name === 'JsonWebTokenError') {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
-
-  res.status(err.statusCode || 500).json({
-    error: err.message || 'Internal server error',
-  });
+  res.status(status).json({ error: message, ...(details ? { details } : {}), requestId: req.id });
 };
 
 module.exports = errorHandler;
+module.exports.errorHandler = errorHandler;
+module.exports.notFoundHandler = notFoundHandler;
