@@ -52,6 +52,8 @@ const UserSchema = new Schema({
   skills:       [{ type: String, trim: true, maxlength: 40 }],
   languages:    [{ type: String, trim: true, maxlength: 40 }],
   discoverable: { type: Boolean, default: true }, // shows up in network search / suggestions
+  // Who can see email + phone on the public profile. Default: only people with a signed contract.
+  contactVisibility: { type: String, enum: ['nobody', 'contracts', 'connections'], default: 'contracts' },
 
   // Plan — `plan` is only ever written by the billing service, never by user input.
   plan:          { type: String, enum: ['free', 'premium'], default: 'free' },
@@ -110,6 +112,9 @@ const UserSchema = new Schema({
     applications: { type: Number, default: 0 },
   },
   lastLoginAt: { type: Date },
+  // Report cards — recomputed by services/reputation.js whenever something that feeds them changes.
+  reputation: { type: mongoose.Schema.Types.Mixed, default: {} },
+  payoutTypes: [{ type: String }], // verified payout types, e.g. ['bank','payoneer'] — public, no details
 }, { timestamps: true });
 
 UserSchema.index({ discoverable: 1, skills: 1 });
@@ -133,6 +138,7 @@ UserSchema.methods.badges = function badges() {
     identity: this.identity?.status === 'approved',
     linked: Boolean(this.googleId || this.githubId),
     premium: this.effectivePlan === 'premium',
+    payout: (this.payoutTypes || []).length > 0,
   };
 };
 
@@ -169,6 +175,7 @@ UserSchema.methods.toClient = function toClient() {
     skills: this.skills,
     languages: this.languages,
     discoverable: this.discoverable,
+    contactVisibility: this.contactVisibility || 'contracts',
     plan: this.effectivePlan,
     planInterval: this.planInterval,
     planExpiresAt: this.planExpiresAt,
@@ -180,6 +187,8 @@ UserSchema.methods.toClient = function toClient() {
     badges: this.badges(),
     identity: { status: this.identity?.status || 'none', submittedAt: this.identity?.submittedAt, reviewedAt: this.identity?.reviewedAt, note: this.identity?.note || '' },
     savedJobs: this.savedJobs || [],
+    reputation: this.reputation || {},
+    payoutTypes: this.payoutTypes || [],
     isAdmin: require('../config/env').ADMIN_EMAILS.includes(String(this.email).toLowerCase()),
     createdAt: this.createdAt,
   };
@@ -207,6 +216,8 @@ UserSchema.methods.toPublic = function toPublic() {
     skills: this.skills,
     languages: this.languages,
     badges: this.badges(),
+    reputation: this.reputation || {},
+    payoutTypes: this.payoutTypes || [],
     createdAt: this.createdAt,
   };
 };

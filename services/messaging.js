@@ -27,8 +27,8 @@ async function isBlocked(senderId, recipientId) {
 }
 
 /** Post a message and update thread metadata + recipient unread count. */
-async function post(convo, { sender = null, text = '', kind = 'text', attachment }) {
-  const msg = await Message.create({ conversation: convo._id, sender, kind, text, attachment });
+async function post(convo, { sender = null, text = '', kind = 'text', attachment, flags }) {
+  const msg = await Message.create({ conversation: convo._id, sender, kind, text, attachment, flags });
   const others = convo.participants.filter((p) => String(p) !== String(sender));
   const inc = {};
   others.forEach((p) => { inc[`unread.${p}`] = 1; });

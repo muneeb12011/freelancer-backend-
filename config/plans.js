@@ -5,32 +5,31 @@ const PLANS = {
   free: {
     id: 'free',
     name: 'Free',
-    tagline: 'Run your freelance business from one place.',
+    tagline: 'Find work and hire with the full safety net.',
     prices: { month: 0, year: 0 },
     limits: { aiPerDay: 15, applicationsPerMonth: 15, openJobs: 3 },
     features: [
-      'Unlimited clients, tasks and invoices',
-      'Kanban board with time tracking',
-      'Messages, connections and the jobs board',
-      '15 job applications a month, 3 open job posts',
-      'Atelier: rate calculator, time tracker, expenses, notes, brand kit, estimator, email templates',
-      '15 AI requests a day',
+      '15 job applications a month — no paid bidding credits',
+      '3 open job posts, including paid trials',
+      'Signed milestone contracts with scope lock and change requests',
+      'Client report cards, no-ghosting rule and scam shield',
+      'Squads, verified payouts, ID verification',
+      '15 AI drafts a day (job posts, applications, milestone plans)',
     ],
   },
   premium: {
     id: 'premium',
     name: 'Premium',
-    tagline: 'For freelancers who bill every month.',
+    tagline: 'For people who apply or hire every week.',
     prices: { month: 19, year: 190 }, // USD
     limits: { aiPerDay: 250, applicationsPerMonth: Infinity, openJobs: 25 },
     features: [
       'Everything in Free',
-      'Unlimited job applications, up to 25 open job posts',
-      'Earnings analytics and tax summary',
-      'Smart contracts and proposal builder',
-      'Client insights and business health score',
+      'Unlimited job applications',
+      'Up to 25 open job posts',
+      'Priority review for ID and payout checks',
       'AI profile review',
-      '250 AI requests a day',
+      '250 AI drafts a day',
     ],
   },
 };
@@ -38,9 +37,6 @@ const PLANS = {
 const INTERVAL_DAYS = { month: 30, year: 365 };
 
 // Features that require Premium — used by both API middleware and the frontend lock chips.
-const PREMIUM_FEATURES = [
-  'contracts', 'proposals', 'analytics', 'tax',
-  'ai:health-score', 'ai:client-insight', 'ai:profile-review',
-];
+const PREMIUM_FEATURES = ['ai:profile-review'];
 
 module.exports = { PLANS, INTERVAL_DAYS, PREMIUM_FEATURES };

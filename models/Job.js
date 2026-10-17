@@ -18,7 +18,21 @@ const JobSchema = new mongoose.Schema({
   locationType: { type: String, enum: ['remote', 'onsite', 'hybrid'], default: 'remote' },
   location:   { type: String, trim: true, maxlength: 120, default: '' },
   applyBy:    { type: Date },
-  status:     { type: String, enum: ['open', 'closed', 'filled'], default: 'open', index: true },
+  status:     { type: String, enum: ['open', 'closed', 'filled', 'review'], default: 'open', index: true },
+  // Paid trial: a small, paid test task. The client can start trials with several applicants.
+  kind:       { type: String, enum: ['standard', 'trial'], default: 'standard' },
+  trialSlots: { type: Number, min: 1, max: 10, default: 3 },
+  // Scam shield verdict: clear · warn (shown with a caution) · held (waits for admin review)
+  safety: {
+    score:  { type: Number, default: 0 },
+    flags:  [{ code: String, label: String, tip: String, _id: false }],
+    verdict:{ type: String, enum: ['clear', 'warn', 'held'], default: 'clear' },
+    reviewedAt: { type: Date },
+  },
+  // No-ghosting: the last time the poster looked at or answered applicants.
+  posterActiveAt: { type: Date },
+  closedReason: { type: String, enum: ['', 'poster', 'filled', 'no_response', 'removed'], default: '' },
+  reminderSentAt: { type: Date },
   applicationsCount: { type: Number, default: 0 },
   views:      { type: Number, default: 0 },
   hired:      [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],

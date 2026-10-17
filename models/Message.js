@@ -10,6 +10,8 @@ const MessageSchema = new mongoose.Schema({
     id:   { type: mongoose.Schema.Types.ObjectId, ref: 'Attachment' },
     name: String, type: { type: String }, size: Number,
   },
+  // Scam shield: shown to the recipient as a caution under the message.
+  flags:     [{ code: String, label: String, tip: String, _id: false }],
   readAt:    { type: Date },
   deletedAt: { type: Date },
 }, { timestamps: true });

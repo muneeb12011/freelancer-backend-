@@ -96,12 +96,14 @@ test('jobs: post, browse, apply (limit), shortlist, hire → client + thread', a
   await api.patch(`/api/jobs/applications/${appId}`).set(auth(P.token)).send({ status: 'shortlisted' });
   const hire = await api.patch(`/api/jobs/applications/${appId}`).set(auth(P.token)).send({ status: 'hired' });
   assert.equal(hire.status, 200, hire.text);
-  const clients = await api.get('/api/clients').set(auth(F.token));
-  assert.ok(clients.body.clients.some((c) => c.name === 'Poster Person' && c.source === 'Aurelance Jobs'));
+  assert.ok(hire.body.contract?._id, 'hiring drafts a contract');
+  const draft = await api.get(`/api/engagements/${hire.body.contract._id}`).set(auth(F.token));
+  assert.equal(draft.body.contract.status, 'draft');
+  assert.equal(draft.body.contract.milestones[0].amount, 650);
   const mine = await api.get('/api/jobs/applications/mine').set(auth(F.token));
   assert.equal(mine.body.applications[0].status, 'hired');
   const thread = await api.get(`/api/messages/conversations/${hire.body.application.conversation}/messages`).set(auth(F.token));
-  assert.ok(thread.body.messages.some((m) => m.kind === 'system' && /hired/.test(m.text)));
+  assert.ok(thread.body.messages.some((m) => m.kind === 'system' && /wants to hire/.test(m.text)));
   assert.equal((await api.delete(`/api/jobs/${jid}`).set(auth(P.token))).status, 400, 'cannot delete after hire');
 });
 
@@ -135,10 +137,10 @@ test('verification: submit encrypted ID, admin approves, images purged, badge sh
   assert.equal(pub.body.profile.badges.identity, true);
 });
 
-test('connections: accept opens a conversation, contacts list, contact details only for connections', async () => {
+test('connections: accept opens a conversation, contacts list, contact details only when the person shares them', async () => {
   const A = await reg('Ali Network', 'ali@example.com');
   const B = await reg('Bina Network', 'bina@example.com');
-  await api.patch('/api/profile').set(auth(B.token)).send({ phone: '+92 300 0000000' });
+  await api.patch('/api/profile').set(auth(B.token)).send({ phone: '+92 300 0000000', contactVisibility: 'connections' });
   const before = await api.get(`/api/profile/${B.user._id}`).set(auth(A.token));
   assert.equal(before.body.profile.email, undefined, 'email hidden before connecting');
 

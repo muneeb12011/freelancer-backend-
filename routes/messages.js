@@ -18,6 +18,7 @@ const Message = require('../models/Message');
 const Attachment = require('../models/Attachment');
 const User = require('../models/User');
 const messaging = require('../services/messaging');
+const scamShield = require('../services/scamShield');
 const { createTicket } = require('../services/tickets');
 const { protect } = require('../middleware/auth');
 const { asyncHandler, badRequest, notFound, forbidden } = require('../utils/http');
@@ -54,6 +55,8 @@ function shapeMessage(m, me) {
     text: m.deletedAt ? '' : m.text,
     deleted: Boolean(m.deletedAt),
     attachment: m.deletedAt || !m.attachment?.id ? null : m.attachment,
+    // Only the recipient sees the caution; the sender gets a softer note.
+    flags: m.deletedAt ? [] : (m.flags || []),
     readAt: m.readAt,
     createdAt: m.createdAt,
   };
@@ -154,6 +157,8 @@ router.post('/conversations/:id/messages', sendLimit, asyncHandler(async (req, r
   if (await messaging.isBlocked(req.user._id, recipient)) throw forbidden('You can’t message this person');
 
   const text = str(req.body.text, 5000);
+  if (scamShield.containsCardNumber(text)) throw badRequest('That looks like a full card number. Never send card numbers in chat — share a verified payout method on the contract instead.');
+  const { flags } = scamShield.analyze(text);
   let attachment;
   if (req.body.attachment) {
     const { name, type, data } = req.body.attachment;
@@ -166,7 +171,7 @@ router.post('/conversations/:id/messages', sendLimit, asyncHandler(async (req, r
   }
   if (!text && !attachment) throw badRequest('Message is empty');
 
-  const msg = await messaging.post(convo, { sender: req.user._id, text, attachment });
+  const msg = await messaging.post(convo, { sender: req.user._id, text, attachment, flags: flags.filter((f) => f.code !== 'contact_details') });
   messaging.notify(convo, req.user, text).catch(() => {});
   res.status(201).json({ message: shapeMessage(msg.toObject(), req.user._id) });
 }));

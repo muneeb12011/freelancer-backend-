@@ -22,6 +22,11 @@ const Attachment = require('../models/Attachment');
 const Job = require('../models/Job');
 const JobApplication = require('../models/JobApplication');
 const IdentityVerification = require('../models/IdentityVerification');
+const Engagement = require('../models/Engagement');
+const Review = require('../models/Review');
+const PayoutMethod = require('../models/PayoutMethod');
+const Squad = require('../models/Squad');
+const Report = require('../models/Report');
 
 const OWNED = { Client, Connection, Contract, Deadline, Earning, Invoice, Note, Proposal, Task, WorkspaceDoc };
 
@@ -36,6 +41,11 @@ async function exportData(userId) {
   out.jobsPosted = await Job.find({ postedBy: userId }).lean();
   out.jobApplications = await JobApplication.find({ applicant: userId }).lean();
   const convos = await Conversation.find({ participants: userId }).select('_id participants').lean();
+  out.contracts = await Engagement.find({ $or: [{ client: userId }, { freelancer: userId }] }).lean();
+  out.reviewsWritten = await Review.find({ from: userId }).lean();
+  out.reviewsReceived = await Review.find({ to: userId, visibleAt: { $ne: null } }).lean();
+  out.payoutMethods = (await PayoutMethod.find({ user: userId }).lean()).map((m) => ({ type: m.type, display: m.display, holderName: m.holderName, status: m.status, createdAt: m.createdAt }));
+  out.squads = await Squad.find({ 'members.user': userId }).lean();
   out.messages = await Message.find({ conversation: { $in: convos.map((c) => c._id) }, sender: userId }).select('conversation text createdAt').lean();
   return out;
 }
@@ -56,6 +66,11 @@ async function deleteAccount(userId) {
     JobApplication.deleteMany({ applicant: userId }),
     Job.find({ postedBy: userId }).distinct('_id').then((ids) => Promise.all([Job.deleteMany({ _id: { $in: ids } }), JobApplication.deleteMany({ job: { $in: ids } })])),
     IdentityVerification.deleteMany({ user: userId }),
+    PayoutMethod.deleteMany({ user: userId }),
+    Report.deleteMany({ by: userId }),
+    Squad.deleteMany({ lead: userId }),
+    Squad.updateMany({ 'members.user': userId }, { $pull: { members: { user: userId } } }),
+    // Contracts stay as a record for the other party; reviews the person wrote stay on others' report cards.
   ]);
   await User.deleteOne({ _id: userId });
 }

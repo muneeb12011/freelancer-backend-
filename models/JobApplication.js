@@ -9,7 +9,13 @@ const JobApplicationSchema = new mongoose.Schema({
   bid:        { type: Number, min: 0, required: true },
   timeline:   { type: String, maxlength: 120, default: '' },
   links:      [{ type: String, maxlength: 300 }],
-  status:     { type: String, enum: ['submitted', 'shortlisted', 'rejected', 'hired', 'withdrawn'], default: 'submitted' },
+  // rejected = "Declined" in the app; closed = the job closed before the poster decided (counts as ghosted)
+  status:     { type: String, enum: ['submitted', 'shortlisted', 'rejected', 'trial', 'hired', 'withdrawn', 'closed'], default: 'submitted' },
+  squad:      { type: mongoose.Schema.Types.ObjectId, ref: 'Squad' }, // applied as a squad (applicant is the lead)
+  viewedAt:   { type: Date },           // poster opened it
+  respondedAt:{ type: Date },           // first shortlist / decline / trial / hire
+  declineReason: { type: String, enum: ['', 'budget', 'skills', 'experience', 'chose_other', 'not_hiring', 'other'], default: '' },
+  engagement: { type: mongoose.Schema.Types.ObjectId, ref: 'Engagement' },
   posterNote: { type: String, maxlength: 1000, default: '', select: false }, // private to the poster
   conversation: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation' },
 }, { timestamps: true });

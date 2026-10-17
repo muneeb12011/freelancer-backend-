@@ -56,63 +56,8 @@ test('plan cannot be self-upgraded', async () => {
   await api.patch('/api/profile').set(auth(A.token)).send({ plan: 'premium' });
   const me = await api.get('/api/auth/me').set(auth(A.token));
   assert.equal(me.body.user.plan, 'free');
-  const c = await api.get('/api/contracts').set(auth(A.token));
+  const c = await api.post('/api/ai/profile-review').set(auth(A.token)).send({ input: 'x' });
   assert.equal(c.status, 402);
-});
-
-test('clients + invoices keep stats in sync, ownership enforced', async () => {
-  const c = await api.post('/api/clients').set(auth(A.token)).send({ name: 'Acme', email: 'ops@acme.test', revenue: 999999, user: B.user._id });
-  assert.equal(c.status, 201, c.text);
-  assert.equal(c.body.client.revenue, 0);
-  assert.equal(String(c.body.client.user), String(A.user._id));
-  const cid = c.body.client._id;
-
-  const inv = await api.post('/api/invoices').set(auth(A.token)).send({ client: cid, items: [{ description: 'Build', quantity: 2, rate: 150 }], taxRate: 10, total: 1 });
-  assert.equal(inv.status, 201, inv.text);
-  assert.equal(inv.body.invoice.total, 330);
-  assert.match(inv.body.invoice.invoiceNumber, /^INV-\d{4}$/);
-
-  await api.patch(`/api/invoices/${inv.body.invoice._id}`).set(auth(A.token)).send({ status: 'paid' });
-  const after = await api.get(`/api/clients/${cid}`).set(auth(A.token));
-  assert.equal(after.body.client.revenue, 330);
-  assert.equal(after.body.client.paidInvoices, 1);
-
-  // B can't see or move A's data
-  assert.equal((await api.get(`/api/clients/${cid}`).set(auth(B.token))).status, 404);
-  const move = await api.patch(`/api/clients/${cid}`).set(auth(A.token)).send({ user: B.user._id, name: 'Acme Ltd' });
-  assert.equal(move.status, 200);
-  assert.equal(String(move.body.client.user), String(A.user._id));
-
-  const s = await api.get('/api/clients?search=(a+)+$').set(auth(A.token));
-  assert.equal(s.status, 200);
-});
-
-test('tasks: numbering, completion toggle, time log', async () => {
-  const t1 = await api.post('/api/tasks').set(auth(A.token)).send({ title: 'Wireframes', priority: 'High' });
-  const t2 = await api.post('/api/tasks').set(auth(A.token)).send({ title: 'Copy' });
-  assert.equal(t1.body.task.taskNumber, 'TK-0001');
-  assert.equal(t2.body.task.taskNumber, 'TK-0002');
-  const done = await api.patch(`/api/tasks/${t1.body.task._id}`).set(auth(A.token)).send({ completed: true });
-  assert.equal(done.body.task.status, 'done');
-  assert.ok(done.body.task.completedAt);
-  const tl = await api.post(`/api/tasks/${t2.body.task._id}/time`).set(auth(A.token)).send({ minutes: 45, note: 'draft' });
-  assert.equal(tl.body.task.trackedMinutes, 45);
-  const stats = await api.get('/api/tasks/stats').set(auth(A.token));
-  assert.equal(stats.body.counts.done, 1);
-});
-
-test('dashboard + deadlines + activity', async () => {
-  const d = await api.post('/api/deadlines').set(auth(A.token)).send({ title: 'Tax filing', dueDate: '2030-01-15', priority: 'High' });
-  assert.equal(d.status, 201, d.text);
-  const list = await api.get('/api/deadlines').set(auth(A.token));
-  assert.equal(list.body.deadlines.length, 1);
-  const dash = await api.get('/api/dashboard').set(auth(A.token));
-  assert.equal(dash.status, 200, dash.text);
-  assert.equal(dash.body.totalRevenue, 330);
-  const rev = await api.get('/api/dashboard/revenue?months=3').set(auth(A.token));
-  assert.equal(rev.body.data.length, 3);
-  const act = await api.get('/api/activity').set(auth(A.token));
-  assert.ok(act.body.activity.length > 0);
 });
 
 test('network: search, request, accept, mirrored chat', async () => {
@@ -165,7 +110,6 @@ test('billing: plans, signed return activates premium idempotently, bad webhook 
   const wh = await api.post('/api/billing/safepay/webhook').set('x-sfpy-signature', 'nope').send({ data: { tracker: 'track_123' } });
   assert.equal(wh.status, 401);
 
-  assert.equal((await api.get('/api/contracts').set(auth(A.token))).status, 200);
   const hist = await api.get('/api/billing/history').set(auth(A.token));
   assert.equal(hist.body.payments.length, 1);
 });
@@ -212,14 +156,14 @@ test('ai is gated and fails clearly without a key', async () => {
   const r = await api.post('/api/ai/support-chat').set(auth(A.token)).send({ input: 'How do I upgrade?' });
   assert.equal(r.status, 503);
   const C = await register('Free User', 'free@example.com');
-  const p = await api.post('/api/ai/health-score').set(auth(C.token)).send({ input: 'x' });
+  const p = await api.post('/api/ai/profile-review').set(auth(C.token)).send({ input: 'x' });
   assert.equal(p.status, 402);
 });
 
 test('export + delete account', async () => {
   const ex = await api.get('/api/settings/download-data').set(auth(A.token));
   assert.equal(ex.status, 200);
-  assert.equal(ex.body.clients.length, 1);
+  assert.ok(Array.isArray(ex.body.contracts));
   const no = await api.delete('/api/auth/account').set(auth(B.token)).send({ confirm: 'DELETE', password: 'wrong' });
   assert.equal(no.status, 401);
   const login = await api.post('/api/auth/login').send({ email: 'bilal@example.com', password: 'new-password-123' });

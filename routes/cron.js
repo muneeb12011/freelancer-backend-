@@ -1,13 +1,16 @@
 // routes/cron.js — scheduled jobs. One daily entry point (Vercel Cron Hobby allows daily jobs):
 //   GET /api/cron/daily   Authorization: Bearer $CRON_SECRET
-// Runs: Premium renewal reminders · task-due-tomorrow reminders · newly overdue invoices · Monday digest.
+// Runs: Premium renewal reminders · no-ghosting auto-close · unpaid-milestone nudges · review reveal.
 const router  = require('express').Router();
 const env     = require('../config/env');
 const logger  = require('../utils/logger');
 const User    = require('../models/User');
-const Task    = require('../models/Task');
-const Invoice = require('../models/Invoice');
+const Job     = require('../models/Job');
+const JobApplication = require('../models/JobApplication');
+const Engagement = require('../models/Engagement');
+const Review  = require('../models/Review');
 const email   = require('../services/email');
+const reputation = require('../services/reputation');
 const { asyncHandler } = require('../utils/http');
 const { safeEqual } = require('../utils/tokens');
 
@@ -17,13 +20,12 @@ router.use((req, res, next) => {
   return next();
 });
 
+const DAY = 86400e3;
 const wants = (u, key) => (u.notifications || {})[key] !== false;
-const usd = (n) => `$${Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
-const ymd = (d) => d.toISOString().slice(0, 10);
 
 async function renewalReminders() {
   const now = new Date();
-  const users = await User.find({ plan: 'premium', planCancelAtPeriodEnd: { $ne: true }, planExpiresAt: { $gt: now, $lte: new Date(Date.now() + 7 * 86400e3) } }).limit(500);
+  const users = await User.find({ plan: 'premium', planCancelAtPeriodEnd: { $ne: true }, planExpiresAt: { $gt: now, $lte: new Date(Date.now() + 7 * DAY) } }).limit(500);
   let sent = 0;
   for (const u of users) {
     if (u.planReminderFor && u.planReminderFor.getTime() === u.planExpiresAt.getTime()) continue;
@@ -35,76 +37,79 @@ async function renewalReminders() {
   return sent;
 }
 
-async function taskReminders() {
-  const start = new Date(); start.setUTCHours(24, 0, 0, 0);
-  const end = new Date(start.getTime() + 86400e3);
-  const tasks = await Task.find({ completed: false, status: { $ne: 'done' }, deadline: { $gte: start, $lt: end } }).select('user title taskNumber').lean();
-  const byUser = tasks.reduce((m, t) => { (m[t.user] = m[t.user] || []).push(t); return m; }, {});
+// No-ghosting rule: a job whose oldest unanswered application is 14+ days old, and whose poster
+// hasn't touched applicants for 14 days, closes. Every waiting applicant is told, and it counts
+// against the poster's response rate. Posters get a warning from day 10.
+async function noGhosting(now = Date.now()) {
+  let warned = 0; let closed = 0;
+  const waiting = await JobApplication.find({ status: { $in: ['submitted', 'shortlisted'] }, respondedAt: null, createdAt: { $lte: new Date(now - 10 * DAY) } }).select('job createdAt').lean();
+  const jobIds = [...new Set(waiting.map((a) => String(a.job)))];
+  for (const id of jobIds) {
+    const job = await Job.findById(id);
+    if (!job || job.status !== 'open') continue;
+    const oldest = Math.min(...waiting.filter((a) => String(a.job) === id).map((a) => new Date(a.createdAt).getTime()));
+    const lastActive = new Date(job.posterActiveAt || job.createdAt).getTime();
+    const quiet = now - Math.max(lastActive, oldest);
+    const poster = await User.findById(job.postedBy).select('email name').lean();
+    if (!poster) continue;
+    if (quiet >= 14 * DAY) {
+      job.status = 'closed'; job.closedReason = 'no_response'; await job.save();
+      const apps = await JobApplication.find({ job: job._id, status: { $in: ['submitted', 'shortlisted'] } });
+      for (const a of apps) {
+        a.status = 'closed'; await a.save();
+        const u = await User.findById(a.applicant).select('email name notifications').lean();
+        if (u && wants(u, 'jobAlerts')) {
+          email.send({ to: u.email, subject: `Closed without an answer: ${job.title}`, html: email.layout({ heading: 'This job closed', intro: `“${email.esc(job.title)}” closed because the client didn’t answer applicants for 14 days. It’s recorded on their report card so others know.`, action: { label: 'Find more work', url: `${env.CLIENT_URL}/jobs` } }) }).catch(() => {});
+        }
+      }
+      await reputation.touch(poster._id);
+      closed += 1;
+    } else if (quiet >= 10 * DAY && (!job.reminderSentAt || now - job.reminderSentAt.getTime() > 5 * DAY)) {
+      job.reminderSentAt = new Date(now); await job.save();
+      email.send({ to: poster.email, subject: `Applicants are waiting: ${job.title}`, html: email.layout({ heading: 'People are waiting to hear back', intro: `Applicants to “${email.esc(job.title)}” haven’t had an answer for over 10 days. If nobody replies within 4 days, the job closes automatically and it shows on your response rate. One tap answers everyone.`, action: { label: 'Answer applicants', url: `${env.CLIENT_URL}/jobs/${job._id}` } }) }).catch(() => {});
+      warned += 1;
+    }
+  }
+  return { warned, closed };
+}
+
+// Approved work not marked paid after 7 days → nudge the client (at most weekly).
+async function paymentNudges(now = Date.now()) {
+  // (Matched in code rather than $elemMatch so it runs on every Mongo-compatible store.)
+  const rows = await Engagement.find({ status: { $in: ['active', 'ended'] }, 'milestones.status': 'approved' }).limit(1000);
   let sent = 0;
-  for (const [uid, list] of Object.entries(byUser)) {
-    const u = await User.findById(uid);
-    if (!u || !wants(u, 'taskReminders')) continue;
-    const items = list.slice(0, 10).map((t) => `• ${email.esc(t.taskNumber || '')} ${email.esc(t.title)}`).join('<br>');
-    await email.send({
-      to: u.email,
-      subject: list.length === 1 ? `Due tomorrow: ${list[0].title}` : `${list.length} tasks are due tomorrow`,
-      html: email.layout({ heading: 'Due tomorrow', intro: `Hi ${email.esc(u.name)}, these are due tomorrow:<br><br>${items}`, action: { label: 'Open tasks', url: `${env.CLIENT_URL}/tasks` } }),
-    }).then(() => { sent += 1; }).catch(() => {});
+  for (const c of rows) {
+    if (!c.milestones.some((m) => m.status === 'approved' && m.approvedAt && m.approvedAt.getTime() <= now - 7 * DAY)) continue;
+    if (c.lastReminderAt && now - c.lastReminderAt.getTime() < 7 * DAY) continue;
+    const client = await User.findById(c.client).select('email name').lean();
+    if (!client) continue;
+    const owed = c.milestones.filter((m) => m.status === 'approved');
+    c.lastReminderAt = new Date(now); await c.save();
+    await email.send({ to: client.email, subject: `Payment due: ${c.title}`, html: email.layout({ heading: 'You approved work that isn’t paid yet', intro: `On “${email.esc(c.title)}” you approved ${owed.length} milestone${owed.length > 1 ? 's' : ''} more than a week ago. Mark them paid once the money is sent — how quickly clients pay shows on their report card.`, action: { label: 'Open the contract', url: `${env.CLIENT_URL}/contracts/${c._id}` } }) }).then(() => { sent += 1; }).catch(() => {});
   }
   return sent;
 }
 
-async function overdueInvoices() {
-  const yesterday = ymd(new Date(Date.now() - 86400e3));
-  const invoices = await Invoice.find({ status: { $in: ['sent', 'draft'] }, dueDate: yesterday }).select('user invoiceNumber clientName total').lean();
-  const byUser = invoices.reduce((m, i) => { (m[i.user] = m[i.user] || []).push(i); return m; }, {});
-  let sent = 0;
-  for (const [uid, list] of Object.entries(byUser)) {
-    const u = await User.findById(uid);
-    if (!u || !wants(u, 'overdueAlerts')) continue;
-    const items = list.map((i) => `• ${email.esc(i.invoiceNumber)} — ${email.esc(i.clientName)} — ${usd(i.total)}`).join('<br>');
-    await email.send({
-      to: u.email,
-      subject: list.length === 1 ? `${list[0].clientName}’s invoice is now overdue` : `${list.length} invoices became overdue`,
-      html: email.layout({ heading: 'Now overdue', intro: `Hi ${email.esc(u.name)}, these invoices passed their due date yesterday:<br><br>${items}<br><br>A short, friendly reminder today usually gets them paid this week.`, action: { label: 'Open invoices', url: `${env.CLIENT_URL}/invoices` } }),
-    }).then(() => { sent += 1; }).catch(() => {});
-  }
-  return sent;
+// Review window over → reveal what was written, so nobody can hold a review hostage.
+async function revealReviews(now = Date.now()) {
+  const ended = await Engagement.find({ reviewWindowEndsAt: { $lte: new Date(now) } }).select('_id client freelancer').limit(2000).lean();
+  const hidden = await Review.find({ engagement: { $in: ended.map((c) => c._id) }, visibleAt: null }).select('engagement').lean();
+  if (!hidden.length) return 0;
+  await Review.updateMany({ _id: { $in: hidden.map((r) => r._id) } }, { $set: { visibleAt: new Date(now) } });
+  const touched = ended.filter((c) => hidden.some((h) => String(h.engagement) === String(c._id)));
+  await reputation.touch(...touched.flatMap((c) => [c.client, c.freelancer]));
+  return hidden.length;
 }
 
-async function weeklyDigest() {
-  if (new Date().getUTCDay() !== 1) return 0; // Mondays
-  const since = new Date(Date.now() - 7 * 86400e3);
-  const users = await User.find({ 'notifications.emailDigest': { $ne: false }, lastLoginAt: { $gte: new Date(Date.now() - 60 * 86400e3) } }).limit(2000);
-  let sent = 0;
-  for (const u of users) {
-    const [paid, open, due] = await Promise.all([
-      Invoice.find({ user: u._id, status: 'paid', paidAt: { $gte: since } }).select('total').lean(),
-      Invoice.find({ user: u._id, status: { $in: ['sent', 'overdue'] } }).select('total').lean(),
-      Task.countDocuments({ user: u._id, completed: false, deadline: { $gte: new Date(), $lt: new Date(Date.now() + 7 * 86400e3) } }),
-    ]);
-    if (!paid.length && !open.length && !due) continue;
-    const sum = (rows) => rows.reduce((s, r) => s + (r.total || 0), 0);
-    await email.send({
-      to: u.email,
-      subject: 'Your week in Aurelance',
-      html: email.layout({
-        heading: 'Your week',
-        intro: `Hi ${email.esc(u.name)},<br><br>Collected last 7 days: <strong>${usd(sum(paid))}</strong> (${paid.length} invoice${paid.length === 1 ? '' : 's'})<br>Still owed to you: <strong>${usd(sum(open))}</strong><br>Tasks due this week: <strong>${due}</strong>`,
-        action: { label: 'Open dashboard', url: `${env.CLIENT_URL}/dashboard` },
-        outro: 'Turn this off in Settings → Notifications.',
-      }),
-    }).then(() => { sent += 1; }).catch(() => {});
-  }
-  return sent;
-}
+const JOBS = { renewalReminders, noGhosting, paymentNudges, revealReviews };
 
 router.get(['/daily', '/renewal-reminders'], asyncHandler(async (req, res) => {
   const results = {};
-  for (const [name, job] of Object.entries({ renewalReminders, taskReminders, overdueInvoices, weeklyDigest })) {
+  for (const [name, job] of Object.entries(JOBS)) {
     try { results[name] = await job(); } catch (err) { results[name] = `error: ${err.message}`; logger.error(`cron ${name} failed: ${err.message}`); }
   }
   res.json({ ok: true, results });
 }));
 
+router.jobs = JOBS;
 module.exports = router;
