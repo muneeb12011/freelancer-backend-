@@ -11,6 +11,39 @@ const Job = require('../models/Job');
 const Review = require('../models/Review');
 const User = require('../models/User');
 const logger = require('../utils/logger');
+const Dispute = require('../models/Dispute');
+const Conversation = require('../models/Conversation');
+const Message = require('../models/Message');
+
+/** Disputes decided against this person, split by the role they had on the contract. */
+async function disputesLost(userId) {
+  const rows = await Dispute.find({ status: 'resolved', $or: [{ openedBy: userId }, { against: userId }] }).select('engagement openedBy against resolution.outcome').lean();
+  const lost = rows.filter((d) => (String(d.against) === String(userId) && d.resolution?.outcome === 'for_opener') || (String(d.openedBy) === String(userId) && d.resolution?.outcome === 'for_other'));
+  if (!lost.length) return { asClient: 0, asFreelancer: 0 };
+  const cs = await Engagement.find({ _id: { $in: lost.map((d) => d.engagement) } }).select('client').lean();
+  const asClient = cs.filter((c) => String(c.client) === String(userId)).length;
+  return { asClient, asFreelancer: lost.length - asClient };
+}
+
+/** Median hours to reply to a new message, from the person's 30 most recent conversations. */
+async function replyHours(userId) {
+  const convos = await Conversation.find({ participants: userId, 'lastMessage.at': { $ne: null } }).sort({ 'lastMessage.at': -1 }).limit(30).select('_id').lean();
+  const samples = [];
+  for (const c of convos) {
+    // eslint-disable-next-line no-await-in-loop
+    const msgs = await Message.find({ conversation: c._id, kind: 'text' }).sort({ createdAt: -1 }).limit(60).select('sender createdAt').lean();
+    msgs.reverse();
+    let waitingSince = null;
+    for (const m of msgs) {
+      const mine = String(m.sender) === String(userId);
+      if (!mine && !waitingSince) waitingSince = new Date(m.createdAt);
+      if (mine && waitingSince) { samples.push((new Date(m.createdAt) - waitingSince) / 3600e3); waitingSince = null; }
+    }
+  }
+  if (samples.length < 3) return null;
+  const s = samples.sort((a, b) => a - b);
+  return Math.round(s[Math.floor(s.length / 2)] * 10) / 10;
+}
 
 const DAY = 86400e3;
 const avg = (xs) => (xs.length ? Math.round((xs.reduce((s, x) => s + x, 0) / xs.length) * 10) / 10 : null);
@@ -96,9 +129,13 @@ async function freelancerCard(userId) {
 async function refresh(userId) {
   if (!userId) return null;
   try {
-    const [asClient, asFreelancer] = await Promise.all([clientCard(userId), freelancerCard(userId)]);
-    const reputation = { asClient, asFreelancer, updatedAt: new Date() };
+    const [asClient, asFreelancer, lost, reply] = await Promise.all([clientCard(userId), freelancerCard(userId), disputesLost(userId), replyHours(userId)]);
+    asClient.disputesLost = lost.asClient;
+    asFreelancer.disputesLost = lost.asFreelancer;
+    const reputation = { asClient, asFreelancer, replyHours: reply, updatedAt: new Date() };
     await User.updateOne({ _id: userId }, { $set: { reputation } });
+    const u = await User.findById(userId).select('identity.status reputation').lean();
+    await require('./jobSearch').syncPosterSignals(u);
     return reputation;
   } catch (err) {
     logger.warn(`reputation refresh failed for ${userId}: ${err.message}`);

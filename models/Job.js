@@ -36,11 +36,38 @@ const JobSchema = new mongoose.Schema({
   applicationsCount: { type: Number, default: 0 },
   views:      { type: Number, default: 0 },
   hired:      [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  // Search helpers, kept in sync on save: lowercase skills (so skill filters use an index instead
+  // of case-insensitive regexes) and the poster's trust signals (so "reliable clients only" is a
+  // field match instead of a lookup over every user).
+  skillsKey:  [{ type: String, maxlength: 40 }],
+  posterSignals: {
+    reliable:     { type: Boolean, default: false },
+    verified:     { type: Boolean, default: false },
+    responseRate: { type: Number, default: null },
+  },
 }, { timestamps: true });
+
+JobSchema.pre('validate', function syncKeys(next) {
+  if (this.isModified('skills') || !this.skillsKey?.length) this.skillsKey = [...new Set((this.skills || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean))];
+  next();
+});
+
+/** Trust signals from a poster's user record; "reliable" = answers most applicants, or ID-verified. */
+JobSchema.statics.signalsFor = (user) => {
+  const rate = user?.reputation?.asClient?.responseRate;
+  const verified = user?.identity?.status === 'approved';
+  return { verified, responseRate: rate ?? null, reliable: verified || (typeof rate === 'number' && rate >= 60) };
+};
 
 JobSchema.index({ status: 1, createdAt: -1 });
 JobSchema.index({ status: 1, category: 1, createdAt: -1 });
-JobSchema.index({ skills: 1 });
+JobSchema.index({ status: 1, skillsKey: 1, createdAt: -1 });
+JobSchema.index({ status: 1, 'posterSignals.reliable': 1, createdAt: -1 });
+// Ranked keyword search. Title matters most, then skills, then the description.
+JobSchema.index(
+  { title: 'text', skills: 'text', description: 'text' },
+  { name: 'job_text', weights: { title: 10, skills: 6, description: 1 }, default_language: 'english' },
+);
 
 JobSchema.statics.CATEGORIES = CATEGORIES;
 

@@ -159,6 +159,9 @@ router.post('/conversations/:id/messages', sendLimit, asyncHandler(async (req, r
   const text = str(req.body.text, 5000);
   if (scamShield.containsCardNumber(text)) throw badRequest('That looks like a full card number. Never send card numbers in chat — share a verified payout method on the contract instead.');
   const { flags } = scamShield.analyze(text);
+  if ((await scamShield.posterRisk(req.user._id, { cached: true })).reporters >= 3) {
+    flags.push({ code: 'reported_sender', label: 'Several people have reported this sender', tip: 'Don’t pay anything or share documents until you’ve checked their record and reviews.' });
+  }
   let attachment;
   if (req.body.attachment) {
     const { name, type, data } = req.body.attachment;
@@ -207,7 +210,8 @@ router.get('/attachments/:id', asyncHandler(async (req, res) => {
   const file = await Attachment.findById(req.params.id).select('+data');
   if (!file) throw notFound('File not found');
   const convo = await Conversation.findById(file.conversation).select('participants').lean();
-  if (!convo || !convo.participants.some((p) => String(p) === String(req.user._id))) throw notFound('File not found');
+  const isAdmin = require('../config/env').ADMIN_EMAILS.includes(String(req.user.email).toLowerCase());
+  if (!convo || (!convo.participants.some((p) => String(p) === String(req.user._id)) && !isAdmin)) throw notFound('File not found');
   res.setHeader('Content-Type', file.type);
   res.setHeader('Content-Length', file.size);
   res.setHeader('Content-Disposition', `${/^image\//.test(file.type) && req.query.download !== '1' ? 'inline' : 'attachment'}; filename="${encodeURIComponent(file.name)}"`);

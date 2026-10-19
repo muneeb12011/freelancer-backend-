@@ -18,6 +18,12 @@
 //   GET    /api/engagements/:id/payout              full details of the shared method (the two parties only)
 //   POST   /api/engagements/:id/end                 { reason }
 //   POST   /api/engagements/:id/review              { ratings, wouldWorkAgain, comment }
+//   Hourly contracts:
+//   GET    /api/engagements/:id/time?week=YYYY-MM-DD   entries for a week + every week's status
+//   POST   /api/engagements/:id/time                  { date, minutes, note }  freelancer
+//   PATCH  /api/engagements/:id/time/:eid · DELETE      freelancer, while the week is open
+//   POST   /api/engagements/:id/timesheets            { week }  freelancer → a timesheet milestone
+//   PATCH  /api/engagements/:id/hourly                { weeklyCap }  client, active contract
 const router = require('express').Router();
 const Engagement = require('../models/Engagement');
 const Attachment = require('../models/Attachment');
@@ -31,6 +37,9 @@ const messaging = require('../services/messaging');
 const contracts = require('../services/contracts');
 const reputation = require('../services/reputation');
 const payouts = require('../services/payouts');
+const notify = require('../services/notify');
+const timesheets = require('../services/timesheets');
+const TimeEntry = require('../models/TimeEntry');
 const { protect } = require('../middleware/auth');
 const { asyncHandler, badRequest, notFound, forbidden } = require('../utils/http');
 const { isId, str } = require('../utils/sanitize');
@@ -99,6 +108,7 @@ async function shape(c, me) {
   const role = String(doc.client) === String(me._id) ? 'client' : String(doc.freelancer) === String(me._id) ? 'freelancer' : 'member';
 
   const reviews = await Review.find({ engagement: doc._id }).lean();
+  const disputes = await require('../models/Dispute').find({ engagement: doc._id }).sort({ createdAt: -1 }).lean();
   const mine = reviews.find((r) => String(r.from) === String(me._id));
   const theirs = reviews.find((r) => String(r.from) !== String(me._id));
 
@@ -126,12 +136,22 @@ async function shape(c, me) {
       theirsSubmitted: Boolean(theirs),
     },
     sharedPayout,
+    disputes,
+    time: doc.billing === 'hourly' ? await hourlySummary(doc) : null,
     events: (doc.events || []).slice(-60).reverse(),
   };
 }
 
+async function hourlySummary(doc) {
+  const thisWeek = timesheets.weekOf(new Date());
+  const weeks = await timesheets.weeksSummary(doc);
+  const current = weeks.find((w) => w.week === thisWeek);
+  return { thisWeek, thisWeekMinutes: current?.minutes || 0, capMinutes: (doc.hourly?.weeklyCap || 0) * 60, weeks };
+}
+
 async function finishIfDone(c, by) {
   if (c.status !== 'active') return false;
+  if (c.billing === 'hourly') return false; // hourly contracts run until someone ends them
   if (c.milestones.length && c.milestones.every((m) => m.status === 'received')) {
     c.status = 'completed';
     c.completedAt = new Date();
@@ -145,7 +165,10 @@ async function finishIfDone(c, by) {
 
 async function save(c, req, announceText) {
   await c.save();
-  if (announceText) await contracts.announce(c, announceText);
+  if (announceText) {
+    await contracts.announce(c, announceText);
+    if (req.role !== 'member') notify.push(otherParty(c, req.role), { type: 'contract', title: announceText, body: c.title, link: `/contracts/${c._id}`, actor: req.user._id });
+  }
   reputation.touch(c.client, c.freelancer);
   return shape(c, req.user);
 }
@@ -170,6 +193,7 @@ router.get('/', asyncHandler(async (req, res) => {
       const next = r.milestones.find((m) => m.status !== 'received');
       return {
         _id: r._id, title: r.title, kind: r.kind, status: r.status, currency: r.currency, updatedAt: r.updatedAt, createdAt: r.createdAt,
+        billing: r.billing || 'fixed', hourly: r.billing === 'hourly' ? r.hourly : undefined,
         myRole: String(r.client) === String(req.user._id) ? 'client' : String(r.freelancer) === String(req.user._id) ? 'freelancer' : 'member',
         client: byId[String(r.client)] || null, freelancer: byId[String(r.freelancer)] || null,
         total, received: r.milestones.filter((m) => m.status === 'received').reduce((s, m) => s + m.amount, 0),
@@ -196,9 +220,52 @@ router.post('/', asyncHandler(async (req, res) => {
     kind: req.body.kind === 'trial' ? 'trial' : 'standard',
     title, summary: str(req.body.summary, 4000),
     currency: ['USD', 'PKR', 'EUR', 'GBP', 'AED'].includes(req.body.currency) ? req.body.currency : 'USD',
-    milestones: cleanMilestones(req.body.milestones),
+    ...(req.body.billing === 'hourly' && req.body.kind !== 'trial'
+      ? { billing: 'hourly', hourly: timesheets.cleanTerms(req.body.hourly || req.body), milestones: [] }
+      : { milestones: cleanMilestones(req.body.milestones) }),
   });
   res.status(201).json({ contract: await shape(contract, req.user) });
+}));
+
+// ── Payment statement ──────────────────────────────────────────────────
+// Every confirmed payment in a date range — for bank remittance checks, FBR returns and your own books.
+//   GET /api/engagements/statement?from=YYYY-MM-DD&to=YYYY-MM-DD&role=freelancer|client&format=json|csv
+router.get('/statement', asyncHandler(async (req, res) => {
+  const role = req.query.role === 'client' ? 'client' : 'freelancer';
+  const from = req.query.from ? new Date(`${req.query.from}T00:00:00Z`) : new Date(new Date().getFullYear(), 0, 1);
+  const to = req.query.to ? new Date(`${req.query.to}T23:59:59Z`) : new Date();
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) throw badRequest('Pick a valid date range');
+  const contractsRows = await Engagement.find({ [role]: req.user._id, 'milestones.status': 'received' }).select('title currency client freelancer milestones').lean();
+  const others = await User.find({ _id: { $in: contractsRows.map((c) => (role === 'freelancer' ? c.client : c.freelancer)) } }).select('name email location').lean();
+  const oById = Object.fromEntries(others.map((u) => [String(u._id), u]));
+  const rows = [];
+  for (const c of contractsRows) {
+    const other = oById[String(role === 'freelancer' ? c.client : c.freelancer)];
+    for (const m of c.milestones) {
+      const at = m.payment?.confirmedAt ? new Date(m.payment.confirmedAt) : null;
+      if (m.status !== 'received' || !at || at < from || at > to) continue;
+      rows.push({
+        date: at.toISOString().slice(0, 10), contract: c.title, contractId: String(c._id), milestone: m.title,
+        counterparty: other?.name || 'Deleted account', counterpartyLocation: other?.location || '',
+        currency: c.currency, amount: m.amount, method: m.payment.method || '', reference: m.payment.reference || '',
+      });
+    }
+  }
+  rows.sort((a, b) => a.date.localeCompare(b.date));
+  const totals = rows.reduce((t, r) => { t[r.currency] = Math.round(((t[r.currency] || 0) + r.amount) * 100) / 100; return t; }, {});
+  if (req.query.format === 'csv') {
+    const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const head = ['Date confirmed', 'Contract', 'Milestone', role === 'freelancer' ? 'Client' : 'Freelancer', 'Location', 'Currency', 'Amount', 'Method', 'Reference', 'Contract ID'];
+    const lines = [head.map(cell).join(','), ...rows.map((r) => [r.date, r.contract, r.milestone, r.counterparty, r.counterpartyLocation, r.currency, r.amount.toFixed(2), r.method, r.reference, r.contractId].map(cell).join(','))];
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="aurelance-statement-${req.query.from || 'start'}-to-${req.query.to || 'today'}.csv"`);
+    return res.send(`\uFEFF${lines.join('\r\n')}`);
+  }
+  return res.json({
+    role, from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10), rows, totals,
+    holder: { name: req.user.name, email: req.user.email, location: req.user.location, identityVerified: req.user.identity?.status === 'approved' },
+    generatedAt: new Date(),
+  });
 }));
 
 router.get('/:id', asyncHandler(async (req, res) => {
@@ -213,7 +280,9 @@ router.patch('/:id', asyncHandler(async (req, res) => {
   if (req.body.title !== undefined) { const t = str(req.body.title, 140); if (t.length < 4) throw badRequest('Give the contract a short title'); c.title = t; }
   if (req.body.summary !== undefined) c.summary = str(req.body.summary, 4000);
   if (req.body.currency && ['USD', 'PKR', 'EUR', 'GBP', 'AED'].includes(req.body.currency)) c.currency = req.body.currency;
-  if (req.body.milestones) c.milestones = cleanMilestones(req.body.milestones);
+  if (c.billing === 'hourly') {
+    if (req.body.hourly || req.body.rate !== undefined || req.body.weeklyCap !== undefined) c.hourly = { ...(c.hourly?.toObject?.() || c.hourly || {}), ...timesheets.cleanTerms(req.body.hourly || req.body, { partial: true }) };
+  } else if (req.body.milestones) c.milestones = cleanMilestones(req.body.milestones);
   const hadSignatures = Boolean(c.signatures?.client?.at || c.signatures?.freelancer?.at);
   c.signatures = {};
   c.termsVersion += 1;
@@ -280,6 +349,7 @@ router.post('/:id/milestones/:mid/submit', asyncHandler(async (req, res) => {
   need(req, 'freelancer');
   if (c.status !== 'active') throw badRequest('The contract isn’t active');
   const m = milestoneOf(c, req.params.mid);
+  if (m.source === 'timesheet') throw badRequest('Timesheets are submitted from the week view, after you fix the logged time');
   if (m.status !== 'open') throw badRequest('This milestone has already been submitted');
   const note = str(req.body.note, 3000);
   if (note.length < 10) throw badRequest('Say what you’re delivering (a link, what changed, how to check it)');
@@ -451,15 +521,112 @@ router.post('/:id/end', asyncHandler(async (req, res) => {
   if (c.status !== 'active') throw badRequest('Only an active contract can be ended');
   const reason = str(req.body.reason, 600);
   if (reason.length < 10) throw badRequest('Give a short reason — it’s kept on the contract record');
-  c.status = 'ended';
+  let billedOnEnd = 0;
+  if (c.billing === 'hourly') {
+    // Nothing logged is lost: open weeks with time are submitted as timesheets first.
+    for (const w of await timesheets.weeksSummary(c)) {
+      if (w.minutes && timesheets.weekOpen(c, w.week) && await timesheets.submitWeek(c, w.week)) billedOnEnd += 1;
+    }
+  }
+  // An hourly contract that billed time and was closed is finished normally, not cut short.
+  const finished = c.billing === 'hourly' && c.milestones.some((m) => m.source === 'timesheet');
+  c.status = finished ? 'completed' : 'ended';
+  if (finished) c.completedAt = new Date();
   c.endedAt = new Date();
   c.endedBy = req.user._id;
   c.endReason = reason;
   c.reviewWindowEndsAt = new Date(Date.now() + REVIEW_WINDOW_DAYS * DAY);
   c.changeRequests.forEach((x) => { if (x.status === 'pending') { x.status = 'withdrawn'; x.decidedAt = new Date(); } });
-  const owed = c.milestones.filter((m) => ['approved', 'paid'].includes(m.status));
+  const owed = c.milestones.filter((m) => ['submitted', 'approved', 'paid'].includes(m.status) && (m.source === 'timesheet' || m.status !== 'submitted'));
+  if (billedOnEnd) c.log(req.user._id, `${billedOnEnd} unsubmitted week${billedOnEnd > 1 ? 's were' : ' was'} submitted as timesheets on closing`);
   c.log(req.user._id, `${req.user.name} ended the contract: ${reason}`);
-  res.json({ contract: await save(c, req, `${req.user.name} ended “${c.title}”: ${reason}${owed.length ? ` — ${owed.length} approved milestone${owed.length > 1 ? 's are' : ' is'} still to be settled.` : ''}`) });
+  res.json({ contract: await save(c, req, `${req.user.name} ${finished ? 'closed' : 'ended'} “${c.title}”: ${reason}${owed.length ? ` — ${owed.length} ${c.billing === 'hourly' ? 'timesheet' : 'approved milestone'}${owed.length > 1 ? 's are' : ' is'} still to be settled.` : ''}`) });
+}));
+
+// ── hourly: time entries and weekly timesheets ─────────────────────────
+function needHourly(c) { if (c.billing !== 'hourly') throw badRequest('This is a fixed-price contract'); }
+const shapeEntry = (e) => ({ _id: e._id, date: e.date, week: e.week, minutes: e.minutes, note: e.note, createdAt: e.createdAt });
+
+router.get('/:id/time', asyncHandler(async (req, res) => {
+  const c = await load(req);
+  needHourly(c);
+  const week = timesheets.parseDay(req.query.week) ? timesheets.weekOf(req.query.week) : timesheets.weekOf(new Date());
+  const entries = await TimeEntry.find({ engagement: c._id, week }).sort({ date: 1, createdAt: 1 }).lean();
+  const sheet = timesheets.sheetFor(c, week);
+  res.json({
+    week, label: timesheets.weekLabel(week), days: timesheets.weekDays(week),
+    entries: entries.map(shapeEntry),
+    minutes: entries.reduce((s, e) => s + e.minutes, 0),
+    capMinutes: (c.hourly?.weeklyCap || 0) * 60, rate: c.hourly?.rate, currency: c.currency,
+    open: c.status === 'active' && timesheets.weekOpen(c, week),
+    sheet: sheet ? { _id: sheet._id, status: sheet.status, amount: sheet.amount, revisions: sheet.revisions } : null,
+    weeks: await timesheets.weeksSummary(c),
+  });
+}));
+
+router.post('/:id/time', asyncHandler(async (req, res) => {
+  const c = await load(req, { write: true });
+  need(req, 'freelancer');
+  needHourly(c);
+  if (c.status !== 'active') throw badRequest('Log time once both of you have signed');
+  const minutes = req.body.minutes !== undefined ? req.body.minutes : Number(req.body.hours) * 60;
+  const data = await timesheets.checkEntry(c, { date: req.body.date, minutes, note: req.body.note });
+  const e = await TimeEntry.create({ ...data, engagement: c._id, freelancer: req.user._id });
+  res.status(201).json({ entry: shapeEntry(e) });
+}));
+
+async function ownEntry(req, c) {
+  if (!isId(req.params.eid)) throw notFound('Entry not found');
+  const e = await TimeEntry.findOne({ _id: req.params.eid, engagement: c._id });
+  if (!e) throw notFound('Entry not found');
+  if (!timesheets.weekOpen(c, e.week)) throw badRequest('That week’s timesheet is submitted. The client can send it back if something needs fixing.');
+  return e;
+}
+
+router.patch('/:id/time/:eid', asyncHandler(async (req, res) => {
+  const c = await load(req, { write: true });
+  need(req, 'freelancer');
+  needHourly(c);
+  const e = await ownEntry(req, c);
+  const minutes = req.body.minutes !== undefined ? req.body.minutes : req.body.hours !== undefined ? Number(req.body.hours) * 60 : e.minutes;
+  const data = await timesheets.checkEntry(c, { date: req.body.date || e.date, minutes, note: req.body.note ?? e.note }, e._id);
+  Object.assign(e, data);
+  await e.save();
+  res.json({ entry: shapeEntry(e) });
+}));
+
+router.delete('/:id/time/:eid', asyncHandler(async (req, res) => {
+  const c = await load(req, { write: true });
+  need(req, 'freelancer');
+  needHourly(c);
+  const e = await ownEntry(req, c);
+  await e.deleteOne();
+  res.json({ ok: true });
+}));
+
+router.post('/:id/timesheets', asyncHandler(async (req, res) => {
+  const c = await load(req, { write: true });
+  need(req, 'freelancer');
+  needHourly(c);
+  if (c.status !== 'active') throw badRequest('The contract isn’t active');
+  const m = await timesheets.submitWeek(c, String(req.body.week || ''));
+  if (!m) throw badRequest('There’s no time logged that week');
+  c.log(req.user._id, `Submitted the timesheet “${m.title}”`);
+  contracts.notifyByEmail(c.client, `Timesheet: ${m.title}`, 'A timesheet is ready to review', `${req.user.name} submitted <strong>${m.title}</strong> (${contracts.money(c.currency, m.amount)}) on “${c.title}”. Approve it or send it back with a note.`, c._id);
+  res.json({ contract: await save(c, req, `${req.user.name} submitted the timesheet “${m.title}” — ${contracts.money(c.currency, m.amount)}.`) });
+}));
+
+router.patch('/:id/hourly', asyncHandler(async (req, res) => {
+  const c = await load(req, { write: true });
+  need(req, 'client');
+  needHourly(c);
+  if (c.status !== 'active') throw badRequest('Change the weekly limit on the draft before signing');
+  const { weeklyCap } = timesheets.cleanTerms(req.body, { partial: true });
+  if (!weeklyCap) throw badRequest('Set a weekly limit');
+  const before = c.hourly.weeklyCap;
+  c.hourly.weeklyCap = weeklyCap;
+  c.log(req.user._id, `Weekly limit changed from ${before} h to ${weeklyCap} h`);
+  res.json({ contract: await save(c, req, `${req.user.name} changed the weekly limit on “${c.title}” from ${before} h to ${weeklyCap} h. Time already logged this week stays.`) });
 }));
 
 router.post('/:id/review', asyncHandler(async (req, res) => {
@@ -483,6 +650,7 @@ router.post('/:id/review', asyncHandler(async (req, res) => {
   if (other) {
     const now = new Date();
     await Review.updateMany({ engagement: c._id }, { $set: { visibleAt: now } });
+    notify.pushMany([c.client, c.freelancer], { type: 'review.revealed', link: `/contracts/${c._id}`, title: `Both reviews for “${c.title}” are in`, body: 'They’re now on your report cards.' });
     review.visibleAt = now;
   }
   c.log(req.user._id, `${req.user.name} left a review`);

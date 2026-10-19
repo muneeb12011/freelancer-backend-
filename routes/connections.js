@@ -8,6 +8,7 @@ const ConnectionRequest = require('../models/ConnectionRequest');
 const User       = require('../models/User');
 const email      = require('../services/email');
 const messaging  = require('../services/messaging');
+const notify     = require('../services/notify');
 const env        = require('../config/env');
 const { protect } = require('../middleware/auth');
 const { asyncHandler, badRequest, notFound } = require('../utils/http');
@@ -129,6 +130,7 @@ router.post('/request', asyncHandler(async (req, res) => {
   if (existing) return res.json({ message: 'Request already sent', request: existing });
 
   const request = await ConnectionRequest.create({ from: req.user._id, to: target._id, message: str(req.body.message, 500) });
+  notify.push(target._id, { type: 'connection.request', actor: req.user._id, link: '/network?tab=requests', title: `${req.user.name} wants to connect`, body: str(req.body.message, 200) });
   if (target.notifications?.connectionReqs !== false) {
     email.send({
       to: target.email,
@@ -144,6 +146,7 @@ router.post('/request', asyncHandler(async (req, res) => {
 }));
 
 async function acceptRequest(request, me, other) {
+  notify.push(String(request.from) === String(me._id) ? other._id : request.from, { type: 'connection.accepted', actor: me._id, link: `/profile/${me._id}`, title: `${me.name} accepted your connection request`, body: 'Your conversation is in Messages.' });
   request.status = 'accepted';
   request.respondedAt = new Date();
   await request.save();
@@ -207,7 +210,7 @@ router.post('/invite-direct', asyncHandler(async (req, res) => {
     subject: `${req.user.name} invited you to Aurelance`,
     html: email.layout({
       heading: `${email.esc(req.user.name)} invited you`,
-      intro: `${email.esc(req.user.name)} uses Aurelance to run clients, invoices and projects, and wants to add you to their network.${req.body.message ? `<br><br>“${email.esc(str(req.body.message, 500))}”` : ''}`,
+      intro: `${email.esc(req.user.name)} is on Aurelance, the freelance marketplace that keeps a signed record of every contract, and wants to add you to their network.${req.body.message ? `<br><br>“${email.esc(str(req.body.message, 500))}”` : ''}`,
       action: { label: 'Create your free account', url: `${env.CLIENT_URL}/register?ref=${req.user._id}` },
     }),
     replyTo: req.user.email,

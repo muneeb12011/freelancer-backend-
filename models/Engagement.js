@@ -8,6 +8,8 @@
 //   ended     → ended early by either side, with a reason.
 //
 // Milestone flow: open → submitted → approved → paid (client says it paid) → received (freelancer confirms).
+// Hourly contracts have no fixed milestones: the freelancer logs time (TimeEntry), and each week's
+// timesheet becomes a milestone (source 'timesheet', hours × rate) that follows the same flow.
 // A freelancer can answer "paid" with "not received", which raises a payment dispute on the record.
 // Money moves directly between the two; Aurelance keeps the record and builds report cards from it.
 const mongoose = require('mongoose');
@@ -31,7 +33,9 @@ const MilestoneSchema = new Schema({
   amount:  { type: Number, required: true, min: 0 },
   dueDate: { type: Date },
   status:  { type: String, enum: ['open', 'submitted', 'approved', 'paid', 'received'], default: 'open' },
-  source:  { type: String, enum: ['original', 'change'], default: 'original' },
+  source:  { type: String, enum: ['original', 'change', 'timesheet'], default: 'original' },
+  week:    { type: String, maxlength: 10 },   // timesheets: Monday of the week, YYYY-MM-DD (UTC)
+  minutes: { type: Number, min: 0 },          // timesheets: time billed
   delivery: {
     note:  { type: String, maxlength: 3000, default: '' },
     files: [{ type: Id, ref: 'Attachment' }],
@@ -64,6 +68,11 @@ const EngagementSchema = new Schema({
   conversation:{ type: Id, ref: 'Conversation' },
 
   kind:     { type: String, enum: ['standard', 'trial'], default: 'standard' },
+  billing:  { type: String, enum: ['fixed', 'hourly'], default: 'fixed' },
+  hourly: {
+    rate:      { type: Number, min: 0 },             // per hour, in the contract currency
+    weeklyCap: { type: Number, min: 1, max: 80 },    // hours; the client can change it on an active contract
+  },
   title:    { type: String, required: true, trim: true, maxlength: 140 },
   summary:  { type: String, trim: true, maxlength: 4000, default: '' },
   currency: { type: String, enum: ['USD', 'PKR', 'EUR', 'GBP', 'AED'], default: 'USD' },

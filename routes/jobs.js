@@ -28,6 +28,9 @@ const Squad = require('../models/Squad');
 const scamShield = require('../services/scamShield');
 const contracts = require('../services/contracts');
 const reputation = require('../services/reputation');
+const notify = require('../services/notify');
+const jobSearch = require('../services/jobSearch');
+const SavedSearch = require('../models/SavedSearch');
 const env = require('../config/env');
 const email = require('../services/email');
 const messaging = require('../services/messaging');
@@ -60,15 +63,26 @@ function cleanJob(body) {
 }
 
 /** Run the scam shield and set safety + (for the worst posts) hold the job for review. */
-function applySafety(job) {
+// Score the post and, for people with a record of held posts or reports, lower the bar.
+// A post an admin already cleared stays cleared unless an edit adds a new flag.
+async function applySafety(job) {
   const { score, flags } = scamShield.analyze(job.title, job.description);
-  const verdict = scamShield.verdictForJob(score);
-  job.safety = { score, flags, verdict, reviewedAt: job.safety?.reviewedAt };
-  if (verdict === 'held' && !job.safety.reviewedAt && job.status === 'open') job.status = 'review';
+  const risk = await scamShield.posterRisk(job.postedBy);
+  const verdict = scamShield.verdictForJob(score, risk);
+  const before = new Set((job.safety?.flags || []).map((f) => f.code));
+  const newFlag = flags.some((f) => !before.has(f.code));
+  const cleared = job.safety?.reviewedAt && !newFlag;
+  job.safety = { score, flags, verdict, reviewedAt: cleared ? job.safety.reviewedAt : undefined };
+  if (verdict === 'held' && !cleared && job.status === 'open') job.status = 'review';
   return verdict;
 }
 
 async function notifyApplicant(app, job, poster, status) {
+  notify.push(app.applicant, {
+    type: `application.${status}`, actor: poster._id, link: `/jobs/${job._id}`,
+    title: status === 'shortlisted' ? `You’re on the shortlist for “${job.title}”` : `${poster.name} declined your application`,
+    body: status === 'rejected' ? `${job.title}${DECLINE_REASONS[app.declineReason] ? ` — ${DECLINE_REASONS[app.declineReason]}` : ''}` : job.title,
+  });
   const applicant = await User.findById(app.applicant).select('email name notifications').lean();
   if (!applicant || applicant.notifications?.jobAlerts === false) return;
   const why = DECLINE_REASONS[app.declineReason] ? ` They said ${DECLINE_REASONS[app.declineReason]}.` : '';
@@ -99,34 +113,49 @@ async function loadJob(id) {
 
 // ── Browse ──────────────────────────────────────────────────────────────
 router.get('/', asyncHandler(async (req, res) => {
-  const f = { status: 'open' };
-  const { q, category, skills, budgetType, locationType, experience } = req.query;
-  if (q) { const re = searchRegex(q); f.$or = [{ title: re }, { description: re }, { skills: re }]; }
-  if (category && Job.CATEGORIES.includes(category)) f.category = category;
-  if (skills) f.skills = { $in: String(skills).split(',').map((s) => new RegExp(`^${s.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i')).slice(0, 10) };
-  if (['fixed', 'hourly'].includes(budgetType)) f.budgetType = budgetType;
-  if (['remote', 'onsite', 'hybrid'].includes(locationType)) f.locationType = locationType;
-  if (['Entry', 'Intermediate', 'Expert'].includes(experience)) f.experience = experience;
-  if (req.query.min) f.budgetMax = { $gte: Number(req.query.min) || 0 };
-  if (req.query.max) f.budgetMin = { $lte: Number(req.query.max) || 0 };
-  if (req.query.hideMine === 'true') f.postedBy = { $ne: req.user._id };
-  if (['standard', 'trial'].includes(req.query.kind)) f.kind = req.query.kind === 'standard' ? { $ne: 'trial' } : 'trial';
-  if (req.query.safeOnly === 'true') f['safety.verdict'] = { $ne: 'warn' };
-  // Reliable clients: answer applicants (response rate ≥ 60%) or have a verified identity.
-  if (req.query.reliable === 'true') {
-    const good = await User.find({ $or: [{ 'reputation.asClient.responseRate': { $gte: 60 } }, { 'identity.status': 'approved' }] }).select('_id').limit(5000).lean();
-    f.postedBy = { ...(f.postedBy || {}), $in: good.map((u) => u._id) };
-  }
-
-  const sort = { newest: { createdAt: -1 }, budget: { budgetMax: -1, createdAt: -1 }, fewest: { applicationsCount: 1, createdAt: -1 } }[req.query.sort] || { createdAt: -1 };
   const limit = clampInt(req.query.limit, { max: 50, def: 20 });
   const page = clampInt(req.query.page, { min: 1, max: 500, def: 1 });
+  const { rows, total, ranked } = await jobSearch.search(req.query, req.user._id, { page, limit });
+  res.json({ jobs: await withPosters(rows.map(({ score, ...j }) => j), req.user), total, page, pages: Math.ceil(total / limit), ranked });
+}));
 
-  const [rows, total] = await Promise.all([
-    Job.find(f).sort(sort).skip((page - 1) * limit).limit(limit).lean(),
-    Job.countDocuments(f),
-  ]);
-  res.json({ jobs: await withPosters(rows, req.user), total, page, pages: Math.ceil(total / limit) });
+// ── Jobs for you + saved searches (job alerts) ──────────────────────────
+router.get('/for-you', asyncHandler(async (req, res) => {
+  const rows = await jobSearch.forYou(req.user, JobApplication, clampInt(req.query.limit, { max: 20, def: 6 }));
+  res.json({ jobs: await withPosters(rows, req.user) });
+}));
+
+const searchFields = (b) => ({
+  name: str(b.name, 80) || str(b.q, 80) || 'My search',
+  q: str(b.q, 120), category: Job.CATEGORIES.includes(b.category) ? b.category : '',
+  skills: (Array.isArray(b.skills) ? b.skills : String(b.skills || '').split(',')).map((s) => str(s, 40)).filter(Boolean).slice(0, 10),
+  budgetType: ['fixed', 'hourly'].includes(b.budgetType) ? b.budgetType : '',
+  minBudget: Math.max(0, Number(b.minBudget || b.min) || 0),
+  kind: ['standard', 'trial'].includes(b.kind) ? b.kind : '',
+  reliable: b.reliable === true || b.reliable === 'true',
+  email: b.email !== false,
+});
+
+router.get('/searches', asyncHandler(async (req, res) => {
+  res.json({ searches: await SavedSearch.find({ user: req.user._id }).sort({ createdAt: -1 }).lean() });
+}));
+router.post('/searches', asyncHandler(async (req, res) => {
+  if (await SavedSearch.countDocuments({ user: req.user._id }) >= 10) throw badRequest('You can save up to 10 searches');
+  const fields = searchFields(req.body);
+  if (!fields.q && !fields.skills.length && !fields.category && !fields.kind) throw badRequest('Add a keyword, a skill or a category to save this search');
+  const s = await SavedSearch.create({ ...fields, user: req.user._id, lastRunAt: new Date() });
+  res.status(201).json({ search: s, message: fields.email ? 'Saved. We’ll email you new matches once a day.' : 'Saved.' });
+}));
+router.patch('/searches/:sid', asyncHandler(async (req, res) => {
+  if (!isId(req.params.sid)) throw notFound('Search not found');
+  const s = await SavedSearch.findOneAndUpdate({ _id: req.params.sid, user: req.user._id }, { $set: { email: req.body.email !== false } }, { new: true });
+  if (!s) throw notFound('Search not found');
+  res.json({ search: s });
+}));
+router.delete('/searches/:sid', asyncHandler(async (req, res) => {
+  if (!isId(req.params.sid)) throw notFound('Search not found');
+  await SavedSearch.deleteOne({ _id: req.params.sid, user: req.user._id });
+  res.json({ ok: true });
 }));
 
 router.get('/meta', asyncHandler(async (req, res) => {
@@ -177,8 +206,8 @@ router.post('/', asyncHandler(async (req, res) => {
   const data = cleanJob(req.body);
   if (!data.title || data.title.length < 8) throw badRequest('Give the job a clear title (at least 8 characters)');
   if (!data.description || data.description.length < 50) throw badRequest('Describe the work in at least 50 characters');
-  const job = new Job({ ...data, postedBy: req.user._id, posterActiveAt: new Date() });
-  const verdict = applySafety(job);
+  const job = new Job({ ...data, postedBy: req.user._id, posterActiveAt: new Date(), posterSignals: Job.signalsFor(req.user) });
+  const verdict = await applySafety(job);
   await job.save();
   if (verdict === 'held' && env.ADMIN_EMAILS.length) {
     email.send({ to: env.ADMIN_EMAILS[0], subject: `Job held for review: ${job.title}`, html: email.layout({ heading: 'Scam shield held a job', intro: `${email.esc(req.user.name)} posted “${email.esc(job.title)}”. Flags: ${job.safety.flags.map((f) => email.esc(f.label)).join(', ')}.`, action: { label: 'Review it', url: `${env.CLIENT_URL}/admin` } }) }).catch(() => {});
@@ -205,9 +234,9 @@ router.patch('/:id', asyncHandler(async (req, res) => {
   const job = await loadJob(req.params.id);
   if (String(job.postedBy) !== String(req.user._id)) throw forbidden('Only the poster can edit this job');
   Object.assign(job, cleanJob(req.body));
-  const wasHeld = job.status === 'review';
-  const verdict = applySafety(job);
-  if (wasHeld && verdict !== 'held' && !job.closedReason) job.status = 'open';
+  // A held post stays held after an edit: only an admin puts it live. Otherwise scammers could
+  // test phrasings until one slips through, or edit a cleared post into a scam.
+  await applySafety(job);
   job.posterActiveAt = new Date();
   await job.save();
   res.json({ job: (await withPosters([job.toObject()], req.user))[0] });
@@ -285,7 +314,11 @@ router.post('/:id/apply', asyncHandler(async (req, res) => {
 
   const coverLetter = str(req.body.coverLetter, 5000);
   if (coverLetter.length < 50) throw badRequest('Write at least 50 characters about why you’re a good fit');
-  const bid = Number(req.body.bid);
+  // A milestone plan (fixed-price jobs): the total becomes the bid.
+  const plan = job.budgetType === 'fixed' && Array.isArray(req.body.milestones)
+    ? req.body.milestones.slice(0, 8).map((m) => ({ title: str(m?.title, 120), amount: Math.round((Number(m?.amount) || 0) * 100) / 100, days: Math.min(365, Math.max(0, parseInt(m?.days, 10) || 0)) })).filter((m) => m.title && m.amount > 0)
+    : [];
+  const bid = plan.length ? plan.reduce((s, m) => s + m.amount, 0) : Number(req.body.bid);
   if (!Number.isFinite(bid) || bid <= 0) throw badRequest(`Enter your ${job.budgetType === 'hourly' ? 'hourly rate' : 'price'}`);
 
   const existing = await JobApplication.findOne({ job: job._id, applicant: req.user._id });
@@ -310,6 +343,7 @@ router.post('/:id/apply', asyncHandler(async (req, res) => {
 
   const data = {
     squad: squad?._id,
+    milestones: plan,
     coverLetter, bid, timeline: str(req.body.timeline, 120),
     links: (Array.isArray(req.body.links) ? req.body.links : []).map((l) => str(l, 300)).filter((l) => /^https?:\/\//.test(l)).slice(0, 5),
     status: 'submitted', poster: job.postedBy,
@@ -319,6 +353,7 @@ router.post('/:id/apply', asyncHandler(async (req, res) => {
     : await JobApplication.create({ ...data, job: job._id, applicant: req.user._id });
   await Job.updateOne({ _id: job._id }, { $inc: { applicationsCount: existing ? 0 : 1 } });
 
+  notify.push(job.postedBy, { type: 'application.new', actor: req.user._id, link: `/jobs/${job._id}`, title: `${req.user.name} applied${squad ? ` with the squad “${squad.name}”` : ''}`, body: `${job.title} · ${job.currency} ${bid}${job.budgetType === 'hourly' ? '/hr' : ''}` });
   const poster = await User.findById(job.postedBy).select('email name notifications');
   if (poster && poster.notifications?.jobAlerts !== false) {
     email.send({
@@ -396,9 +431,17 @@ router.patch('/applications/:appId', asyncHandler(async (req, res) => {
       contract = await contracts.createDraft({
         client: req.user, freelancer: applicant, squad: app.squad, job, application: app,
         title: job.title, summary: job.description.slice(0, 1500), currency: job.currency,
-        milestones: [hourly
-          ? { title: 'First 10 hours', scope: `Up to 10 hours at ${job.currency} ${app.bid}/hr. Add or split milestones before signing.`, amount: app.bid * 10 }
-          : { title: job.title.slice(0, 120), scope: 'Describe exactly what “done” means for this milestone before you both sign.', amount: app.bid }],
+        // Hourly jobs become real hourly contracts: the applicant's rate, a weekly limit the client sets
+        // (20 h unless they say otherwise; either side can change it on the draft before signing).
+        ...(hourly ? { billing: 'hourly', hourly: { rate: app.bid, weeklyCap: Math.min(80, Math.max(1, parseInt(req.body.weeklyCap, 10) || 20)) } } : {}),
+        milestones: (() => {
+          if (hourly) return [];
+          if (app.milestones?.length) {
+            let days = 0;
+            return app.milestones.map((m) => { days += m.days || 0; return { title: m.title, scope: 'Proposed by the freelancer when applying. Say exactly what “done” means before you both sign.', amount: m.amount, dueDate: m.days ? new Date(Date.now() + days * 86400e3) : undefined }; });
+          }
+          return [{ title: job.title.slice(0, 120), scope: 'Describe exactly what “done” means for this milestone before you both sign.', amount: app.bid }];
+        })(),
       });
       app.engagement = contract._id;
       app.conversation = contract.conversation;

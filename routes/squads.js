@@ -14,6 +14,7 @@ const User = require('../models/User');
 const Connection = require('../models/Connection');
 const Engagement = require('../models/Engagement');
 const messaging = require('../services/messaging');
+const notify = require('../services/notify');
 const { protect } = require('../middleware/auth');
 const { asyncHandler, badRequest, notFound, forbidden } = require('../utils/http');
 const { isId, str, searchRegex, clampInt } = require('../utils/sanitize');
@@ -118,6 +119,7 @@ router.post('/:id/invite', asyncHandler(async (req, res) => {
   if (!invitee) throw notFound('That person doesn’t exist any more');
   s.members.push({ user: invitee._id, role: str(req.body.role, 60), status: 'invited', invitedBy: req.user._id });
   await s.save();
+  notify.push(invitee._id, { type: 'squad.invite', actor: req.user._id, link: `/squads/${s._id}`, title: `${req.user.name} invited you to the squad “${s.name}”`, body: str(req.body.role, 60) ? `Role: ${str(req.body.role, 60)}` : '' });
   const convo = await messaging.findOrCreate(req.user._id, invitee._id);
   await messaging.post(convo, { kind: 'system', text: `${req.user.name} invited ${invitee.name} to join the squad “${s.name}”${req.body.role ? ` as ${str(req.body.role, 60)}` : ''}. Accept it under Talent → Squads.` });
   res.json({ squad: await shape(s.toObject(), req.user) });
@@ -131,6 +133,7 @@ router.post('/:id/:action(accept|decline|leave)', asyncHandler(async (req, res) 
   if (action === 'accept') {
     if (m.status !== 'invited') throw badRequest('You’re already a member');
     m.status = 'active'; m.joinedAt = new Date();
+    notify.push(s.lead, { type: 'squad.joined', actor: req.user._id, link: `/squads/${s._id}`, title: `${req.user.name} joined “${s.name}”` });
   } else {
     if (action === 'leave' && String(s.lead) === String(req.user._id)) throw badRequest('The lead can’t leave. Disband the squad instead.');
     if (action === 'leave' && await Engagement.exists({ squad: s._id, status: 'active' })) throw badRequest('The squad has an active contract. Finish it before leaving.');

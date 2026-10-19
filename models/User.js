@@ -52,6 +52,13 @@ const UserSchema = new Schema({
   skills:       [{ type: String, trim: true, maxlength: 40 }],
   languages:    [{ type: String, trim: true, maxlength: 40 }],
   discoverable: { type: Boolean, default: true }, // shows up in network search / suggestions
+  // Public profile at /u/:handle — lowercase letters, digits and dashes.
+  handle:       { type: String, lowercase: true, trim: true, maxlength: 30, index: { unique: true, sparse: true } },
+  hoursPerWeek: { type: Number, min: 0, max: 80, default: 0 },
+  intent:       { type: String, enum: ['work', 'hire', 'both'], default: 'both' }, // what they came for; shapes Home
+  workingHours: { start: { type: String, default: '' }, end: { type: String, default: '' } }, // "09:00" in their own timezone
+  langs:        [{ name: { type: String, maxlength: 40 }, level: { type: String, enum: ['Basic', 'Conversational', 'Fluent', 'Native'], default: 'Fluent' }, _id: false }],
+  intro:        { type: String, default: '', maxlength: 300 }, // link to a short intro video (YouTube / Loom)
   // Who can see email + phone on the public profile. Default: only people with a signed contract.
   contactVisibility: { type: String, enum: ['nobody', 'contracts', 'connections'], default: 'contracts' },
 
@@ -176,6 +183,13 @@ UserSchema.methods.toClient = function toClient() {
     languages: this.languages,
     discoverable: this.discoverable,
     contactVisibility: this.contactVisibility || 'contracts',
+    handle: this.handle || '',
+    intent: this.intent || 'both',
+    hoursPerWeek: this.hoursPerWeek || 0,
+    workingHours: this.workingHours || {},
+    langs: this.langs || [],
+    intro: this.intro || '',
+    timezone: this.preferences?.timezone || 'UTC',
     plan: this.effectivePlan,
     planInterval: this.planInterval,
     planExpiresAt: this.planExpiresAt,
@@ -218,6 +232,13 @@ UserSchema.methods.toPublic = function toPublic() {
     badges: this.badges(),
     reputation: this.reputation || {},
     payoutTypes: this.payoutTypes || [],
+    handle: this.handle || '',
+    hoursPerWeek: this.hoursPerWeek || 0,
+    workingHours: this.workingHours || {},
+    langs: this.langs || [],
+    intro: this.intro || '',
+    timezone: this.preferences?.timezone || 'UTC',
+    lastActiveAt: this.lastLoginAt,
     createdAt: this.createdAt,
   };
 };

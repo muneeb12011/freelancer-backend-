@@ -47,13 +47,19 @@ app.use(mongoSanitize({ replaceWith: '_' }));       // strips $operators from bo
 app.use(passport.initialize());
 
 // ── Health (no DB required, used by uptime monitors) ────────────────────
-app.get(['/', '/api', '/api/health'], (req, res) => {
+app.get(['/', '/api', '/api/health'], async (req, res) => {
+  // search: 'ranked' once the text index exists (npm run sync-indexes), 'basic' until then.
+  let search = 'unknown';
+  if (dbState() === 'connected') {
+    try { search = (await require('./services/jobSearch').textAvailable()) ? 'ranked' : 'basic'; } catch { /* keep unknown */ }
+  }
   res.json({
     status: 'ok',
     service: 'aurelance-api',
     env: env.NODE_ENV,
     db: dbState(),
     features: env.features,
+    search,
     time: new Date().toISOString(),
   });
 });
@@ -81,6 +87,10 @@ app.use('/api/squads',      require('./routes/squads'));
 app.use('/api/payouts',     require('./routes/payouts'));
 app.use('/api/talent',      require('./routes/talent'));
 app.use('/api/reports',     require('./routes/reports'));
+app.use('/api/notifications', require('./routes/notifications'));
+app.use('/api/disputes',    require('./routes/disputes'));
+app.use('/api/public',      require('./routes/public'));
+app.use('/api/realtime',    require('./routes/realtime'));
 
 app.use(notFoundHandler);
 app.use(errorHandler);

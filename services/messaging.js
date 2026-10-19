@@ -40,6 +40,8 @@ async function post(convo, { sender = null, text = '', kind = 'text', attachment
       $pull: { archivedBy: { $in: convo.participants } },
     },
   );
+  // Ping everyone in the thread (sender too, for their other tabs). The ping carries only ids.
+  require('./realtime').toUsers(convo.participants, 'message', { conversation: String(convo._id), message: String(msg._id) });
   return msg;
 }
 

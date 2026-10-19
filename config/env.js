@@ -44,6 +44,11 @@ const env = {
   RESEND_API_KEY: process.env.RESEND_API_KEY || '',
   EMAIL_FROM:     process.env.EMAIL_FROM || 'Aurelance <onboarding@resend.dev>',
   SUPPORT_INBOX:  process.env.SUPPORT_INBOX || 'aurelance454@gmail.com',
+  // Optional: Pusher Channels for instant notifications/messages. Without these the app polls.
+  PUSHER_APP_ID:  process.env.PUSHER_APP_ID || '',
+  PUSHER_KEY:     process.env.PUSHER_KEY || '',
+  PUSHER_SECRET:  process.env.PUSHER_SECRET || '',
+  PUSHER_CLUSTER: process.env.PUSHER_CLUSTER || '',
 
   // AI (Anthropic)
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
@@ -72,6 +77,7 @@ const env = {
 };
 
 env.features = {
+  realtime: Boolean(env.PUSHER_APP_ID && env.PUSHER_KEY && env.PUSHER_SECRET && env.PUSHER_CLUSTER),
   google:   Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
   github:   Boolean(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET),
   email:    Boolean(env.RESEND_API_KEY),

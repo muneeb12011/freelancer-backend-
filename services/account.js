@@ -1,21 +1,13 @@
 // services/account.js — data export and full account deletion (GDPR-style).
+const mongoose   = require('mongoose');
 const User       = require('../models/User');
-const Client     = require('../models/Client');
 const Connection = require('../models/Connection');
 const ConnectionRequest = require('../models/ConnectionRequest');
-const Contract   = require('../models/Contract');
-const Deadline   = require('../models/Deadline');
-const Earning    = require('../models/Earning');
-const Invoice    = require('../models/Invoice');
-const Note       = require('../models/Note');
 const Payment    = require('../models/Payment');
-const Proposal   = require('../models/Proposal');
 const Session    = require('../models/Session');
-const Task       = require('../models/Task');
 const Ticket     = require('../models/Ticket');
 const Feedback   = require('../models/Feedback');
 const OAuthCode  = require('../models/OAuthCode');
-const WorkspaceDoc = require('../models/WorkspaceDoc');
 const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 const Attachment = require('../models/Attachment');
@@ -28,14 +20,22 @@ const PayoutMethod = require('../models/PayoutMethod');
 const Squad = require('../models/Squad');
 const Report = require('../models/Report');
 
-const OWNED = { Client, Connection, Contract, Deadline, Earning, Invoice, Note, Proposal, Task, WorkspaceDoc };
+// Data from the old freelancer dashboard (clients, invoices, tasks…). Those features are gone, but
+// accounts created before the marketplace may still have rows, so export and deletion reach the raw
+// collections directly instead of keeping dead models around.
+const LEGACY = ['clients', 'contracts', 'deadlines', 'earnings', 'invoices', 'notes', 'proposals', 'tasks', 'workspacedocs'];
+const legacy = (name) => mongoose.connection.db.collection(name);
 
 async function exportData(userId) {
   const user = await User.findById(userId);
   const out = { exportedAt: new Date().toISOString(), account: user.toClient() };
-  await Promise.all(Object.entries(OWNED).map(async ([name, M]) => {
-    out[name.toLowerCase() + 's'] = await M.find({ user: userId }).lean();
+  out.connections = await Connection.find({ user: userId }).lean();
+  const old = {};
+  await Promise.all(LEGACY.map(async (name) => {
+    const rows = await legacy(name).find({ user: user._id }).toArray().catch(() => []);
+    if (rows.length) old[name] = rows;
   }));
+  if (Object.keys(old).length) out.legacyDashboard = old;
   out.payments = await Payment.find({ user: userId }).select('-raw').lean();
   out.supportTickets = await Ticket.find({ user: userId }).lean();
   out.jobsPosted = await Job.find({ postedBy: userId }).lean();
@@ -52,7 +52,8 @@ async function exportData(userId) {
 
 async function deleteAccount(userId) {
   await Promise.all([
-    ...Object.values(OWNED).map((M) => M.deleteMany({ user: userId })),
+    Connection.deleteMany({ user: userId }),
+    ...LEGACY.map((name) => legacy(name).deleteMany({ user: new mongoose.Types.ObjectId(String(userId)) }).catch(() => null)),
     Session.deleteMany({ user: userId }),
     OAuthCode.deleteMany({ user: userId }),
     Feedback.deleteMany({ user: userId }),

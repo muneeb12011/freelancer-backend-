@@ -41,7 +41,10 @@ function layout({ heading, intro, action, outro }) {
   </table></td></tr></table></body></html>`;
 }
 
-async function send({ to, subject, html, text, replyTo }) {
+/** Send an email. Registered with keepAlive so un-awaited sends still finish on serverless hosting. */
+function send(msg) { return require('../utils/background').keepAlive(deliver(msg)); }
+
+async function deliver({ to, subject, html, text, replyTo }) {
   const c = getClient();
   if (!c) {
     logger.info(`[email:dev] to=${to} subject="${subject}"`, { text: text || html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, 400) });
@@ -69,7 +72,7 @@ const templates = {
     subject: 'Confirm your email for Aurelance',
     html: layout({
       heading: 'Confirm your email',
-      intro: `Hi ${esc(name)}, confirm this address so invoice receipts and password resets reach you.`,
+      intro: `Hi ${esc(name)}, confirm this address so contract offers, payment updates and password resets reach you.`,
       action: { label: 'Confirm email', url },
     }),
   }),
@@ -129,6 +132,15 @@ const templates = {
     html: layout({
       heading: 'Message received',
       intro: `Hi ${esc(t.name || 'there')}, thanks for writing in about “${esc(t.subject)}”. We reply within one business day. Your reference is <strong>${esc(t.number)}</strong>.`,
+    }),
+  }),
+  ticketReply: (t, text) => ({
+    subject: `Re: [${t.number}] ${t.subject}`,
+    html: layout({
+      heading: 'Support replied',
+      intro: `${esc(text).replace(/\n/g, '<br>')}`,
+      action: t.user ? { label: 'Reply or mark it solved', url: `${env.CLIENT_URL}/support?ticket=${t._id}` } : undefined,
+      outro: t.user ? `Reference ${esc(t.number)}.` : `Reference ${esc(t.number)}. Reply to this email to continue.`,
     }),
   }),
 };

@@ -12,7 +12,11 @@ router.use(protect);
 
 const DAY = 86400e3;
 
+const jobSearch = require('../services/jobSearch');
+const profiles = require('../services/profiles');
+
 router.get('/', asyncHandler(async (req, res) => {
+  profiles.ensureHandle(req.user).catch(() => {});
   const me = req.user._id;
   const now = Date.now();
   const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
@@ -73,7 +77,9 @@ router.get('/', asyncHandler(async (req, res) => {
 
   const appCounts = apps.reduce((m, a) => { const k = a.status === 'submitted' && a.viewedAt ? 'viewed' : a.status; m[k] = (m[k] || 0) + 1; return m; }, {});
 
+  const forYou = (await jobSearch.forYou(req.user, JobApplication, 4)).map((j) => ({ _id: j._id, title: j.title, kind: j.kind, budgetMin: j.budgetMin, budgetMax: j.budgetMax, budgetType: j.budgetType, currency: j.currency, matchedSkills: j.matchedSkills, createdAt: j.createdAt, applicationsCount: j.applicationsCount }));
   res.json({
+    forYou,
     todo: items.slice(0, 30),
     freelancer: {
       applications: appCounts,

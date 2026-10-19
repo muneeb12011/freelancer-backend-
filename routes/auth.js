@@ -55,7 +55,8 @@ router.post('/register', limits.auth, asyncHandler(async (req, res) => {
 
   if (await User.exists({ email: mail })) throw Object.assign(badRequest('An account with this email already exists. Sign in instead.'), { statusCode: 409 });
 
-  const user = new User({ name, email: mail, password });
+  const user = new User({ name, email: mail, password, intent: ['work', 'hire', 'both'].includes(req.body.intent) ? req.body.intent : 'both' });
+  if (/^[A-Za-z_]+\/[A-Za-z_]+/.test(String(req.body.timezone || ''))) user.preferences = { ...(user.preferences?.toObject?.() || {}), timezone: String(req.body.timezone).slice(0, 60) };
   if (isId(req.body.ref) && await User.exists({ _id: req.body.ref })) user.referredBy = req.body.ref;
   const verification = prepareVerification(user);
   await user.save();

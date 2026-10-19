@@ -7,6 +7,8 @@ const JobApplicationSchema = new mongoose.Schema({
   poster:     { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   coverLetter:{ type: String, required: true, minlength: 50, maxlength: 5000 },
   bid:        { type: Number, min: 0, required: true },
+  // Optional milestone plan proposed by the freelancer — becomes the draft contract on hire.
+  milestones: [{ title: { type: String, maxlength: 120 }, amount: { type: Number, min: 0 }, days: { type: Number, min: 0, max: 365 }, _id: false }],
   timeline:   { type: String, maxlength: 120, default: '' },
   links:      [{ type: String, maxlength: 300 }],
   // rejected = "Declined" in the app; closed = the job closed before the poster decided (counts as ghosted)

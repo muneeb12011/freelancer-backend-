@@ -43,6 +43,11 @@ router.post('/', asyncHandler(async (req, res) => {
     const count = await Report.countDocuments({ target: 'job', targetId, status: 'open' });
     if (count >= AUTO_HOLD_AT) await Job.updateOne({ _id: targetId, status: 'open' }, { $set: { status: 'review', 'safety.verdict': 'held' } });
   }
+  // Several established people reporting the same person: pull all their open posts until reviewed.
+  const risk = await require('../services/scamShield').posterRisk(subject);
+  if (risk.reporters >= AUTO_HOLD_AT) {
+    await Job.updateMany({ postedBy: subject, status: 'open', 'safety.reviewedAt': null }, { $set: { status: 'review', 'safety.verdict': 'held' } });
+  }
   if (env.ADMIN_EMAILS.length) {
     email.send({ to: env.ADMIN_EMAILS[0], subject: `Report: ${target} (${reason})`, html: email.layout({ heading: 'New report', intro: `${email.esc(req.user.name)} reported a ${target} for “${reason}”.`, action: { label: 'Open the queue', url: `${env.CLIENT_URL}/admin` } }) }).catch(() => {});
   }

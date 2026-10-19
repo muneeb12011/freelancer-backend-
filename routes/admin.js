@@ -10,6 +10,7 @@ const IdentityVerification = require('../models/IdentityVerification');
 const vault = require('../services/vault');
 const email = require('../services/email');
 const env = require('../config/env');
+const notify = require('../services/notify');
 
 router.use(protect, requireAdmin);
 
@@ -20,13 +21,14 @@ router.get('/overview', asyncHandler(async (req, res) => {
     require('../models/Job').countDocuments({ status: 'review' }),
     require('../models/Report').countDocuments({ status: 'open' }),
   ]);
+  const disputes = await require('../models/Dispute').countDocuments({ status: { $in: ['open', 'responded'] } });
   const [users, premium, openTickets, revenue] = await Promise.all([
     User.countDocuments(),
     User.countDocuments({ plan: 'premium', planExpiresAt: { $gt: new Date() } }),
-    Ticket.countDocuments({ status: { $in: ['open', 'in-progress'] } }),
+    Ticket.countDocuments({ status: { $in: ['open', 'in-progress'] }, awaiting: { $ne: 'user' } }),
     Payment.aggregate([{ $match: { status: 'paid' } }, { $group: { _id: '$currency', total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
   ]);
-  res.json({ users, premium, openTickets, revenue, queues: { identity: pendingIds, payouts: pendingPayouts, jobs: heldJobs, reports: openReports } });
+  res.json({ users, premium, openTickets, revenue, queues: { identity: pendingIds, payouts: pendingPayouts, jobs: heldJobs, reports: openReports, disputes } });
 }));
 
 // Grant/extend Premium manually (e.g. bank transfer, comp account).
@@ -42,15 +44,66 @@ router.post('/users/:id/grant-premium', asyncHandler(async (req, res) => {
   res.json({ user: user.toClient() });
 }));
 
-router.patch('/tickets/:id', asyncHandler(async (req, res) => {
-  const { status, reply } = req.body;
+// Answer a ticket: the reply is stored, the person is notified in the app and by email,
+// and the first answer's time feeds the reply time shown on the Support page.
+async function answerTicket(ticket, admin, { reply, status }) {
   if (status && !['open', 'in-progress', 'resolved', 'closed'].includes(status)) throw badRequest('Unknown status');
-  const ticket = await Ticket.findByIdAndUpdate(req.params.id, {
-    ...(status ? { status } : {}),
-    ...(reply ? { $push: { replies: { from: 'support', text: String(reply).slice(0, 5000) } } } : {}),
-  }, { new: true });
+  const text = reply ? String(reply).trim().slice(0, 5000) : '';
+  if (text) {
+    ticket.replies.push({ from: 'support', text, by: admin._id });
+    if (!ticket.firstResponseAt) ticket.firstResponseAt = new Date();
+    ticket.awaiting = 'user';
+    if (!status && ticket.status === 'open') ticket.status = 'in-progress';
+  }
+  if (status) {
+    ticket.status = status;
+    if (['resolved', 'closed'].includes(status)) { ticket.awaiting = 'none'; if (!ticket.solvedBy) ticket.solvedBy = 'support'; }
+  }
+  ticket.lastActivityAt = new Date();
+  await ticket.save();
+  if (text) {
+    if (ticket.user) notify.push(ticket.user, { type: 'support.reply', link: `/support?ticket=${ticket._id}`, title: `Support replied on ${ticket.number}`, body: text.slice(0, 160) });
+    email.send({ to: ticket.email, ...email.templates.ticketReply(ticket, text) }).catch(() => {});
+  }
+  return ticket;
+}
+
+router.patch('/tickets/:id', asyncHandler(async (req, res) => {
+  const ticket = await Ticket.findById(req.params.id);
   if (!ticket) throw notFound('Ticket not found');
-  res.json({ ticket });
+  res.json({ ticket: await answerTicket(ticket, req.user, req.body) });
+}));
+
+router.post('/tickets/:id/reply', asyncHandler(async (req, res) => {
+  if (!String(req.body.reply || '').trim()) throw badRequest('Write a reply');
+  const ticket = await Ticket.findById(req.params.id);
+  if (!ticket) throw notFound('Ticket not found');
+  res.json({ ticket: await answerTicket(ticket, req.user, req.body) });
+}));
+
+// One ticket with what support needs to answer it: who sent it, their record, the contract.
+router.get('/tickets/:id', asyncHandler(async (req, res) => {
+  const ticket = await Ticket.findById(req.params.id).lean();
+  if (!ticket) throw notFound('Ticket not found');
+  const Engagement = require('../models/Engagement');
+  const Dispute = require('../models/Dispute');
+  const [sender, contract, disputes, others] = await Promise.all([
+    ticket.user ? User.findById(ticket.user).select('name email handle createdAt identity.status reputation emailVerified').lean() : null,
+    ticket.engagement ? Engagement.findById(ticket.engagement).select('title status currency milestones client freelancer createdAt').populate('client', 'name handle').populate('freelancer', 'name handle').lean() : null,
+    ticket.engagement ? Dispute.find({ engagement: ticket.engagement }).select('kind status resolution createdAt').lean() : [],
+    ticket.user ? Ticket.find({ user: ticket.user, _id: { $ne: ticket._id } }).select('number subject status createdAt').sort({ createdAt: -1 }).limit(5).lean() : [],
+  ]);
+  res.json({
+    ticket,
+    sender: sender && { _id: sender._id, name: sender.name, email: sender.email, handle: sender.handle, since: sender.createdAt, identity: sender.identity?.status || 'none', emailVerified: sender.emailVerified, reputation: sender.reputation || {} },
+    contract: contract && {
+      _id: contract._id, title: contract.title, status: contract.status, currency: contract.currency,
+      client: contract.client, freelancer: contract.freelancer,
+      milestones: (contract.milestones || []).map((m) => ({ title: m.title, amount: m.amount, status: m.status, dueDate: m.dueDate, approvedAt: m.approvedAt, payment: m.payment ? { reference: m.payment.reference, markedAt: m.payment.markedAt, confirmedAt: m.payment.confirmedAt, disputedAt: m.payment.disputedAt } : null })),
+    },
+    disputes,
+    otherTickets: others,
+  });
 }));
 
 // ── Identity verification queue ─────────────────────────────────────────
@@ -82,7 +135,9 @@ async function decide(req, res, approved) {
   const user = await User.findById(v.user);
   if (user) {
     user.identity = { status: approved ? 'approved' : 'rejected', submittedAt: v.createdAt, reviewedAt: new Date(), note: reason };
+    notify.push(user._id, { type: `identity.${approved ? 'approved' : 'rejected'}`, link: approved ? '/profile' : '/settings?tab=verification', title: approved ? 'Your ID is verified' : 'Your ID check needs another try', body: approved ? 'The verified badge now shows next to your name.' : reason });
     await user.save();
+    require('../services/jobSearch').syncPosterSignals(user).catch(() => {});
     email.send({
       to: user.email,
       subject: approved ? 'Your identity is verified' : 'We couldn’t verify your identity',
@@ -136,6 +191,7 @@ router.post('/payouts/:id/:decision(approve|reject)', asyncHandler(async (req, r
   const types = await PayoutMethod.distinct('type', { user: m.user, status: 'verified' });
   await User.updateOne({ _id: m.user }, { $set: { payoutTypes: types } });
   const user = await User.findById(m.user).select('email name').lean();
+  notify.push(m.user, { type: `payout.${approved ? 'verified' : 'rejected'}`, link: '/settings?tab=payouts', title: approved ? `${m.display} is verified` : `We couldn’t verify ${m.display}`, body: approved ? 'Clients now see the verified payout badge.' : note });
   if (user) {
     email.send({
       to: user.email,
@@ -172,6 +228,7 @@ router.post('/jobs/:id/:decision(publish|remove)', asyncHandler(async (req, res)
   job.closedReason = publish ? '' : 'removed';
   job.safety = { ...(job.safety?.toObject?.() || job.safety || {}), verdict: publish ? (job.safety?.flags?.length ? 'warn' : 'clear') : 'held', reviewedAt: new Date() };
   await job.save();
+  notify.push(job.postedBy, { type: `job.${publish ? 'published' : 'removed'}`, link: `/jobs/${job._id}`, title: publish ? `“${job.title}” passed review and is live` : `“${job.title}” was removed`, body: publish ? '' : 'It broke the rules on fees, personal data or off-platform contact.' });
   if (!publish) await Report.updateMany({ target: 'job', targetId: job._id, status: 'open' }, { $set: { status: 'actioned', resolution: 'Job removed', resolvedAt: new Date() } });
   res.json({ ok: true });
 }));
@@ -184,10 +241,49 @@ router.post('/reports/:id', asyncHandler(async (req, res) => {
   res.json({ report: r });
 }));
 
+// ── Disputes ────────────────────────────────────────────────────────────
+const Dispute = require('../models/Dispute');
+const Engagement = require('../models/Engagement');
+const reputation = require('../services/reputation');
+const contractsSvc = require('../services/contracts');
+
+router.get('/disputes', asyncHandler(async (req, res) => {
+  const rows = await Dispute.find({ status: { $in: ['open', 'responded'] } }).sort({ createdAt: 1 }).limit(100)
+    .populate('openedBy', 'name email').populate('against', 'name email').lean();
+  const cs = await Engagement.find({ _id: { $in: rows.map((d) => d.engagement) } }).select('title currency milestones client freelancer events conversation').lean();
+  const cById = Object.fromEntries(cs.map((c) => [String(c._id), c]));
+  res.json({ disputes: rows.map((d) => ({ ...d, contract: cById[String(d.engagement)] || null })) });
+}));
+
+router.post('/disputes/:id/resolve', asyncHandler(async (req, res) => {
+  const outcome = ['for_opener', 'for_other', 'shared', 'no_fault'].includes(req.body.outcome) ? req.body.outcome : null;
+  const note = String(req.body.note || '').slice(0, 2000);
+  if (!outcome) throw badRequest('Choose an outcome');
+  if (note.length < 20) throw badRequest('Explain the decision — both people will read it');
+  const d = await Dispute.findOne({ _id: req.params.id, status: { $in: ['open', 'responded'] } });
+  if (!d) throw notFound('Already closed');
+  d.status = 'resolved';
+  d.resolution = { outcome, note, by: req.user._id, at: new Date() };
+  await d.save();
+  const c = await Engagement.findById(d.engagement);
+  if (c) {
+    c.log(req.user._id, `Aurelance decided the dispute: ${note.slice(0, 200)}`);
+    await c.save();
+    await contractsSvc.announce(c, `Aurelance reviewed the dispute and decided: ${note}`);
+  }
+  notify.pushMany([d.openedBy, d.against], { type: 'dispute.resolved', link: `/contracts/${d.engagement}`, title: 'Your dispute has a decision', body: note.slice(0, 200) });
+  reputation.touch(d.openedBy, d.against);
+  res.json({ ok: true });
+}));
+
 router.get('/tickets', asyncHandler(async (req, res) => {
   const status = req.query.status || 'open';
-  const tickets = await Ticket.find(status === 'all' ? {} : { status }).sort({ createdAt: -1 }).limit(100).lean();
-  res.json({ tickets });
+  // "open" here means anything not finished; waiting-on-support first, urgent first, oldest first.
+  const f = status === 'all' ? {} : status === 'open' ? { status: { $in: ['open', 'in-progress'] } } : { status };
+  const rows = await Ticket.find(f).select('-replies.text').sort({ lastActivityAt: 1 }).limit(200).lean();
+  const P = { urgent: 0, high: 1, normal: 2, low: 3 };
+  rows.sort((a, b) => Number(b.awaiting === 'support') - Number(a.awaiting === 'support') || P[a.priority] - P[b.priority]);
+  res.json({ tickets: rows.map((t) => ({ ...t, replyCount: (t.replies || []).length, replies: undefined })) });
 }));
 
 module.exports = router;
