@@ -4,6 +4,10 @@
 //   GET /api/public/share/u/:handle    the app's index.html with this person's title/description/OG tags,
 //                                      so links pasted into WhatsApp, LinkedIn or X show a real preview.
 //                                      The frontend rewrites /u/:handle here (see vercel.json).
+//   GET  /api/public/ledger            platform-wide figures + anonymised recent activity (services/ledger)
+//   GET  /api/public/scam-rules        what the scam shield looks for, its weights and thresholds
+//   POST /api/public/scam-check        { text } → the same check job posts get (signed in, 30/hour)
+//   GET  /api/public/handle?name=      the public link a new account with this name would get
 const router = require('express').Router();
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
@@ -11,8 +15,8 @@ const User = require('../models/User');
 const PortfolioImage = require('../models/PortfolioImage');
 const env = require('../config/env');
 const profiles = require('../services/profiles');
-const { optionalAuth } = require('../middleware/auth');
-const { asyncHandler, notFound } = require('../utils/http');
+const { optionalAuth, protect } = require('../middleware/auth');
+const { asyncHandler, notFound, badRequest } = require('../utils/http');
 const { isId } = require('../utils/sanitize');
 
 const publicLimit = rateLimit({ windowMs: 60e3, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Slow down a little.' } });
@@ -39,6 +43,40 @@ async function publicProfile(user) {
     strength: profiles.strength(user).score,
   };
 }
+
+router.get('/ledger', asyncHandler(async (req, res) => {
+  res.set('Cache-Control', 'public, max-age=300');
+  res.json(await require('../services/ledger').get());
+}));
+
+router.get('/scam-rules', (req, res) => {
+  const { RULES } = require('../services/scamShield');
+  res.set('Cache-Control', 'public, max-age=3600');
+  // Labels, tips and weights only — the patterns themselves stay private so they're harder to dodge.
+  res.json({
+    rules: [...RULES.map((r) => ({ code: r.code, label: r.label, tip: r.tip, weight: r.weight })),
+      { code: 'disguised', label: 'Hides words to get past filters', tip: 'Spacing letters out or swapping in symbols is a common way to sneak contact details or fee requests past checks.', weight: 2 }],
+    thresholds: { warn: 2, hold: 5, repeatOffenderHold: 2 },
+    repeatOffender: { heldPosts: 2, reporters: 3, windowDays: 60 },
+  });
+});
+
+const checkLimit = rateLimit({ windowMs: 60 * 60e3, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false, keyGenerator: (req) => String(req.user?._id || req.ip), message: { error: 'You’ve checked a lot of text this hour. Try again later.' } });
+router.post('/scam-check', protect, checkLimit, (req, res) => {
+  const shield = require('../services/scamShield');
+  const text = String(req.body?.text || '').slice(0, 5000);
+  if (text.trim().length < 10) throw badRequest('Paste the job post or message you want checked');
+  const { score, flags } = shield.analyze(text);
+  res.json({ score, flags, verdict: shield.verdictForJob(score), card: shield.containsCardNumber(text) });
+});
+
+router.get('/handle', asyncHandler(async (req, res) => {
+  const base = profiles.slugify(req.query.name);
+  if (base.length < 3) return res.json({ handle: null, reason: 'short' });
+  if (profiles.RESERVED.has(base) || !profiles.validHandle(base)) return res.json({ handle: null, base, reason: 'reserved' });
+  const taken = Boolean(await User.exists({ handle: base }));
+  res.json({ handle: taken ? null : base, base, taken });
+}));
 
 router.get('/u/:handle', optionalAuth, asyncHandler(async (req, res) => {
   const user = await findByHandle(req.params.handle);
