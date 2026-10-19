@@ -95,3 +95,16 @@ test('handle preview: free, taken, reserved, too short', async () => {
   assert.equal((await api.get('/api/public/handle?name=Admin')).body.reason, 'reserved');
   assert.equal((await api.get('/api/public/handle?name=Al')).body.reason, 'short');
 });
+
+test('lookup: finds people by name or handle, returns only public record lines', async () => {
+  await api.get('/api/profile').set('Authorization', `Bearer ${F.token}`);
+  const byName = await api.get('/api/public/lookup?q=Taim');
+  assert.equal(byName.status, 200);
+  assert.equal(byName.body.people[0].handle, 'taimoor-ali');
+  const byHandle = await api.get('/api/public/lookup?q=@mehwish');
+  assert.equal(byHandle.body.people[0].name, 'Mehwish Akram');
+  const all = JSON.stringify(byName.body) + JSON.stringify(byHandle.body);
+  for (const secret of ['@example.com', 'password', 'payoutMethods']) assert.ok(!all.includes(secret), `leaked ${secret}`);
+  assert.deepEqual((await api.get('/api/public/lookup?q=a')).body.people, [], 'too short');
+  assert.equal((await api.get('/api/public/lookup?q=(.*)')).status, 200, 'regex input is escaped');
+});

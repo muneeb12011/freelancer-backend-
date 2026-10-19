@@ -8,6 +8,8 @@
 //   GET  /api/public/scam-rules        what the scam shield looks for, its weights and thresholds
 //   POST /api/public/scam-check        { text } → the same check job posts get (signed in, 30/hour)
 //   GET  /api/public/handle?name=      the public link a new account with this name would get
+//   GET  /api/public/lookup?q=         look someone up before you apply or hire: name or handle →
+//                                      their public record in one line (30 a minute per network)
 const router = require('express').Router();
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
@@ -76,6 +78,34 @@ router.get('/handle', asyncHandler(async (req, res) => {
   if (profiles.RESERVED.has(base) || !profiles.validHandle(base)) return res.json({ handle: null, base, reason: 'reserved' });
   const taken = Boolean(await User.exists({ handle: base }));
   res.json({ handle: taken ? null : base, base, taken });
+}));
+
+const lookupLimit = rateLimit({ windowMs: 60e3, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many lookups. Wait a minute.' } });
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+router.get('/lookup', lookupLimit, asyncHandler(async (req, res) => {
+  const q = String(req.query.q || '').trim().replace(/^@/, '').slice(0, 60);
+  if (q.length < 2) return res.json({ people: [] });
+  const word = new RegExp(`(^|\\s)${escRe(q)}`, 'i');
+  const rows = await User.find({ discoverable: { $ne: false }, handle: { $nin: [null, ''] }, $or: [{ name: word }, { handle: new RegExp(`^${escRe(q.toLowerCase())}`) }] })
+    .select('name handle title location createdAt identity.status emailVerified payoutTypes workEmail.domain workEmail.verifiedAt reputation')
+    .limit(6).lean();
+  const people = rows.map((u) => {
+    const c = u.reputation?.asClient || {}; const f = u.reputation?.asFreelancer || {};
+    const asClient = []; const asFreelancer = [];
+    if (c.hires) asClient.push(`hired ${c.hires} time${c.hires === 1 ? '' : 's'}`);
+    if (c.responseRate != null) asClient.push(`answers ${c.responseRate}% of applicants`);
+    if (c.avgPayDays != null) asClient.push(c.avgPayDays < 1 ? 'pays the day work is approved' : `pays ${c.avgPayDays} days after approval`);
+    if (c.ghosted) asClient.push(`${c.ghosted} application${c.ghosted === 1 ? '' : 's'} left unanswered`);
+    if (f.completed) asFreelancer.push(`finished ${f.completed} contract${f.completed === 1 ? '' : 's'}`);
+    if (f.onTimeRate != null) asFreelancer.push(`${f.onTimeRate}% delivered on time`);
+    const lost = (c.disputesLost || 0) + (f.disputesLost || 0);
+    return {
+      handle: u.handle, name: u.name, title: u.title || '', location: u.location || '', since: u.createdAt,
+      checks: { identity: u.identity?.status === 'approved', email: Boolean(u.emailVerified), payout: (u.payoutTypes || []).length > 0, work: u.workEmail?.verifiedAt ? u.workEmail.domain : '' },
+      asClient, asFreelancer, disputesLost: lost,
+    };
+  });
+  res.json({ people });
 }));
 
 router.get('/u/:handle', optionalAuth, asyncHandler(async (req, res) => {

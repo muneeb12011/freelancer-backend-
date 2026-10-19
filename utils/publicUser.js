@@ -1,5 +1,5 @@
 // utils/publicUser.js — one shape for "a person" everywhere (messages, jobs, network, applicants).
-const PUBLIC_USER_FIELDS = 'name avatar title location hourlyRate availability skills emailVerified googleId githubId identity.status plan planExpiresAt createdAt lastLoginAt reputation payoutTypes handle';
+const PUBLIC_USER_FIELDS = 'name avatar title location hourlyRate availability skills emailVerified googleId githubId identity.status plan planExpiresAt createdAt lastLoginAt reputation payoutTypes handle workEmail.domain workEmail.verifiedAt';
 
 function badgesOf(u) {
   const premium = u.plan === 'premium' && (!u.planExpiresAt || new Date(u.planExpiresAt) > new Date());
@@ -9,6 +9,7 @@ function badgesOf(u) {
     linked: Boolean(u.googleId || u.githubId),
     premium,
     payout: (u.payoutTypes || []).length > 0,
+    work: u.workEmail?.verifiedAt ? u.workEmail.domain || '' : '',
   };
 }
 

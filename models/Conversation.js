@@ -16,6 +16,10 @@ const ConversationSchema = new mongoose.Schema({
   notifiedAt: { type: Map, of: Date, default: {} },
   job: { type: mongoose.Schema.Types.ObjectId, ref: 'Job' }, // set when started from a job application
   archivedBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  // "Verify on a call": who confirmed the other person read out the same rotating code, and when.
+  callChecks: [{ by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, of: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, at: Date, _id: false }],
+  // userId → last time they asked the other person to verify (throttle)
+  verifyAskedAt: { type: Map, of: Date, default: {} },
 }, { timestamps: true });
 
 ConversationSchema.index({ participants: 1, updatedAt: -1 });

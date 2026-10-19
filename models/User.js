@@ -122,6 +122,17 @@ const UserSchema = new Schema({
   // Report cards — recomputed by services/reputation.js whenever something that feeds them changes.
   reputation: { type: mongoose.Schema.Types.Mixed, default: {} },
   payoutTypes: [{ type: String }], // verified payout types, e.g. ['bank','payoneer'] — public, no details
+  // Work email: proves someone can read mail at a company domain (gmail & co. don't count).
+  // Only the domain is ever shown to others; the address stays private.
+  workEmail: {
+    address:    { type: String, lowercase: true, trim: true, default: '' },
+    domain:     { type: String, lowercase: true, default: '' },
+    verifiedAt: { type: Date },
+    pending:    { type: String, lowercase: true, trim: true, default: '', select: false },
+    codeHash:   { type: String, select: false },
+    expires:    { type: Date, select: false },
+    attempts:   { type: Number, default: 0, select: false },
+  },
 }, { timestamps: true });
 
 UserSchema.index({ discoverable: 1, skills: 1 });
@@ -146,6 +157,7 @@ UserSchema.methods.badges = function badges() {
     linked: Boolean(this.googleId || this.githubId),
     premium: this.effectivePlan === 'premium',
     payout: (this.payoutTypes || []).length > 0,
+    work: this.workEmail?.verifiedAt ? this.workEmail.domain : '',
   };
 };
 

@@ -10,6 +10,10 @@
 //   DELETE /api/messages/:messageId                 → unsend (sender only)
 //   GET    /api/messages/attachments/:id            → file download (participants only)
 //   POST   /api/messages/block/:userId · DELETE /api/messages/block/:userId · POST /api/messages/report/:userId
+//   GET    /api/messages/conversations/:id/trust      → what's been verified about the other person
+//   GET    /api/messages/conversations/:id/call-code  → { code, expiresAt } (same for both people)
+//   POST   /api/messages/conversations/:id/call-check { code } → record that the other person read it out
+//   POST   /api/messages/conversations/:id/ask-verify { what: identity|work|payout }
 const router = require('express').Router();
 const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
@@ -19,6 +23,8 @@ const Attachment = require('../models/Attachment');
 const User = require('../models/User');
 const messaging = require('../services/messaging');
 const scamShield = require('../services/scamShield');
+const trust = require('../services/trust');
+const notify = require('../services/notify');
 const { createTicket } = require('../services/tickets');
 const { protect } = require('../middleware/auth');
 const { asyncHandler, badRequest, notFound, forbidden } = require('../utils/http');
@@ -177,6 +183,57 @@ router.post('/conversations/:id/messages', sendLimit, asyncHandler(async (req, r
   const msg = await messaging.post(convo, { sender: req.user._id, text, attachment, flags: flags.filter((f) => f.code !== 'contact_details') });
   messaging.notify(convo, req.user, text).catch(() => {});
   res.status(201).json({ message: shapeMessage(msg.toObject(), req.user._id) });
+}));
+
+// ── Trust check ────────────────────────────────────────────────────────
+router.get('/conversations/:id/trust', asyncHandler(async (req, res) => {
+  const convo = await loadConvo(req);
+  const other = otherId(convo, req.user._id);
+  const t = other ? await trust.summary(req.user, other, convo) : null;
+  if (!t) throw notFound('This person deleted their account');
+  const mine = (convo.callChecks || []).filter((c) => String(c.of) === String(req.user._id)).sort((a, b) => new Date(b.at) - new Date(a.at))[0];
+  const asked = convo.verifyAskedAt?.get?.(String(req.user._id));
+  const first = !(await Message.exists({ conversation: convo._id, sender: req.user._id, kind: 'text' }));
+  res.json({ trust: t, iWasCallChecked: mine?.at || null, askedAt: asked || null, firstContact: first });
+}));
+
+router.get('/conversations/:id/call-code', asyncHandler(async (req, res) => {
+  const convo = await loadConvo(req);
+  res.set('Cache-Control', 'no-store');
+  res.json(trust.callCode(String(convo._id)));
+}));
+
+const callLimit = rateLimit({ windowMs: 10 * 60e3, limit: 6, standardHeaders: 'draft-7', legacyHeaders: false, keyGenerator: (req) => `${req.user._id}:${req.params.id}`, message: { error: 'Too many tries. Ask them for the code again in a few minutes.', code: 'RATE_LIMITED' } });
+router.post('/conversations/:id/call-check', callLimit, asyncHandler(async (req, res) => {
+  const convo = await loadConvo(req);
+  const other = otherId(convo, req.user._id);
+  if (!other) throw badRequest('This person deleted their account');
+  if (!trust.codeMatches(String(convo._id), req.body.code)) throw badRequest('That code doesn’t match the one on your screen. If they’re reading a different code, they may not be the person on this account.');
+  const at = new Date();
+  await Conversation.updateOne({ _id: convo._id }, { $push: { callChecks: { $each: [{ by: req.user._id, of: other, at }], $slice: -20 } } });
+  const u = await User.findById(other).select('name').lean();
+  await messaging.post(convo, { kind: 'system', text: `${req.user.name} checked on a call that ${u?.name || 'the other person'} could see this conversation’s code — they control this account.` });
+  notify.push(other, { type: 'trust.call', actor: req.user._id, link: `/messages/${convo._id}`, title: `${req.user.name} confirmed it’s you on the call`, body: 'Recorded in your conversation.' });
+  res.json({ ok: true, at });
+}));
+
+const ASK = {
+  identity: ['verify their ID', '/settings?tab=verification'],
+  work: ['confirm a work email', '/settings?tab=verification'],
+  payout: ['verify a payout method', '/settings?tab=payouts'],
+};
+router.post('/conversations/:id/ask-verify', asyncHandler(async (req, res) => {
+  const convo = await loadConvo(req);
+  const other = otherId(convo, req.user._id);
+  const what = ASK[req.body.what] ? req.body.what : 'identity';
+  if (!other) throw badRequest('This person deleted their account');
+  const last = convo.verifyAskedAt?.get?.(String(req.user._id));
+  if (last && Date.now() - new Date(last).getTime() < 3 * 86400e3) throw badRequest('You asked recently. Give them a few days.');
+  await Conversation.updateOne({ _id: convo._id }, { $set: { [`verifyAskedAt.${req.user._id}`]: new Date() } });
+  const u = await User.findById(other).select('name').lean();
+  await messaging.post(convo, { kind: 'system', text: `${req.user.name} asked ${u?.name?.split(' ')[0] || 'you'} to ${ASK[what][0]} before going further. It’s free and stays private — only the result is shown.` });
+  notify.push(other, { type: 'trust.ask', actor: req.user._id, link: ASK[what][1], title: `${req.user.name} asked you to ${ASK[what][0]}`, body: 'People who are verified get answered first.' });
+  res.json({ ok: true });
 }));
 
 router.post('/conversations/:id/read', asyncHandler(async (req, res) => {
